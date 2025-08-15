@@ -8,8 +8,6 @@ from typing import Literal, Optional, List
 import requests
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
@@ -316,29 +314,7 @@ PATRONES_RECHAZO = [
     "son manga corta", "quiero manga larga"
 ]
 
-\1
-
-# --- CORS for web chat UI ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to your frontend domain(s) in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# --- Optional: serve static web chat UI at /app ---
-try:
-    import os
-    if os.path.isdir(os.path.join(os.path.dirname(__file__), "public")):
-        app.mount("/app", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "public"), html=True), name="public")
-except Exception as _e:
-    # Fallback safe: don't crash app if static mount fails
-    pass
-# --- End static mount ---
-
-# --- End CORS ---
+app = FastAPI()
 
 def _has_column(db: Session, table: str, col: str) -> bool:
     try:

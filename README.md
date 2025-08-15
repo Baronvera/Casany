@@ -1,2 +1,1 @@
-# Casany
-text bot
+# cassany-gpt-agent
