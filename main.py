@@ -1,4 +1,4 @@
-APP_BUILD = "build_02"
+APP_BUILD = "build_03"
 
 import os
 import json
@@ -24,6 +24,9 @@ from hubspot_utils import enviar_pedido_a_hubspot
 from utils_intencion import detectar_intencion_atencion
 from utils_mensaje_whatsapp import generar_mensaje_atencion_humana
 from woocommerce_gpt_utils import sugerir_productos, detectar_categoria, detectar_atributos
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from routes_agent import router as agent_router
 
 #  Configuración y cliente OpenAI
 load_dotenv(override=True)
@@ -320,6 +323,8 @@ PATRONES_RECHAZO = [
 ]
 
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(agent_router)
 
 def _has_column(db: Session, table: str, col: str) -> bool:
     try:
@@ -1694,3 +1699,4 @@ async def test_whatsapp():
 
 
 init_db()
+
