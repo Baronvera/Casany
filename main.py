@@ -1317,7 +1317,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
         if idx is not None:
             lista = _get_sugeridos_list(db, session_id)
-            if lista && 1 <= idx <= len(lista):
+            if lista and 1 <= idx <= len(lista):
                 prod = lista[idx - 1]
                 _remember_selection(db, session_id, prod, idx)
                 actualizar_pedido_por_sesion(db, session_id, "producto", prod.get("nombre", ""))
@@ -1602,3 +1602,4 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
