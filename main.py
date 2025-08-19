@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import text
+from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from models import Pedido
@@ -381,6 +381,26 @@ def _get_last_msg_id(db: Session, session_id: str) -> Optional[str]:
         return None
 
 import json as _json
+
+def set_user_filter(db: Session, session_id: str, filtro: dict):
+    try:
+        db.execute(
+            sa_text("UPDATE pedidos SET filtros = :f WHERE session_id = :sid"),
+            {"f": json.dumps(filtro, ensure_ascii=False), "sid": session_id},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+
+def get_user_filter(db: Session, session_id: str) -> Optional[dict]:
+    try:
+        row = db.execute(
+            sa_text("SELECT filtros FROM pedidos WHERE session_id = :sid"),
+            {"sid": session_id},
+        ).fetchone()
+        return json.loads(row[0]) if row and row[0] else None
+    except Exception:
+        return None
 
 def _get_sugeridos_urls(db: Session, session_id: str) -> List[str]:
     try:
@@ -869,11 +889,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
     if filtros_detectados:
         print("[DBG] Guardando filtros:", filtros_detectados)
-        _set_user_filter = lambda db, sid, filtro: db.execute(
-            text("UPDATE pedidos SET sugeridos = :f WHERE session_id = :sid"),
-            {"f": json.dumps(filtro), "sid": sid}
-        ) or db.commit()
-        _set_user_filter(db, session_id, filtros_detectados)
+        set_user_filter(db, session_id, filtros_detectados)
 
     if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
         db.query(Pedido).filter(Pedido.session_id == session_id).delete()
@@ -1506,3 +1522,4 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
