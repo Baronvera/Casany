@@ -1,4 +1,4 @@
-APP_BUILD = "build_05"
+APP_BUILD = "build_06"
 
 import os
 import json
@@ -59,52 +59,6 @@ try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # Python 3.8
-
-# --- WooCommerce (tallas reales) ---
-WOO_URL = (os.getenv("WOO_URL") or "").rstrip("/")
-WOO_KEY = os.getenv("WOO_CONSUMER_KEY")
-WOO_SECRET = os.getenv("WOO_CONSUMER_SECRET")
-
-def _woo_get(path, **params):
-    if not (WOO_URL and WOO_KEY and WOO_SECRET):
-        return []
-    try:
-        r = requests.get(
-            f"{WOO_URL}/wp-json/wc/v3/{path}",
-            params={"consumer_key": WOO_KEY, "consumer_secret": WOO_SECRET, **params},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return []
-
-def woo_product_from_url(url: str):
-    try:
-        slug = url.rstrip("/").split("/")[-1]
-        items = _woo_get("products", slug=slug, per_page=1)
-        return items[0] if items else None
-    except Exception:
-        return None
-
-def woo_tallas_from_url(url: str) -> List[str]:
-    p = woo_product_from_url(url)
-    if not p:
-        return []
-    # Variations only if variable product
-    if p.get("type") == "simple":
-        return []
-    vars_ = _woo_get(f"products/{p['id']}/variations", per_page=100)
-    tallas = set()
-    for v in vars_ or []:
-        if v.get("status") == "publish" and v.get("stock_status") == "instock":
-            for a in v.get("attributes", []):
-                n = (a.get("name") or "").lower()
-                if n in ("talla", "pa_talla", "size", "pa_size"):
-                    opt = str(a.get("option") or "").strip().upper()
-                    if opt:
-                        tallas.add(opt)
-    return sorted(tallas)
 
 # --- Zona horaria local (Bogotá) y helpers de tiempo/JSON ---
 LOCAL_TZ = ZoneInfo("America/Bogota")
@@ -202,27 +156,6 @@ CONFIRM_RE = re.compile(
     r'|(pedido|compra|orden).*(confirmar|confirmo|finalizar|cerrar|terminar|listo|realizar)',
     re.I
 )
-
-# Limpieza de tallas
-TALLAS_VALIDAS = {"XS","S","M","L","XL","XXL","28","30","32","34","36","38","40","42"}
-def _clean_tallas(arr: List[str]) -> List[str]:
-    return [
-        t for t in dict.fromkeys(str(t).strip().upper() for t in (arr or []))
-        if t in TALLAS_VALIDAS
-    ]
-
-def _inject_real_sizes(productos: List[dict]) -> List[dict]:
-    """Devuelve la misma lista pero con tallas_disponibles reales (Woo) y limpias."""
-    out = []
-    for p in productos or []:
-        p2 = dict(p)
-        tallas = []
-        url = p2.get("url")
-        if url:
-            tallas = woo_tallas_from_url(url)
-        p2["tallas_disponibles"] = _clean_tallas(tallas)
-        out.append(p2)
-    return out
 
 # ----- FastAPI app -----
 app = FastAPI()
@@ -367,6 +300,16 @@ PATRONES_RECHAZO = [
     "son manga corta", "quiero manga larga"
 ]
 
+# ---- Limpieza de tallas ----
+TALLAS_VALIDAS = {
+    "XS", "S", "M", "L", "XL", "XXL",
+    "28", "30", "32", "34", "36", "38", "40", "42"
+}
+def _clean_tallas(arr):
+    if not isinstance(arr, list):
+        return []
+    return [t for t in dict.fromkeys([str(t).upper() for t in (arr or [])]) if t in TALLAS_VALIDAS]
+
 def _has_column(db: Session, table: str, col: str) -> bool:
     try:
         rows = db.execute(sa_text(f"PRAGMA table_info({table})")).fetchall()
@@ -488,7 +431,7 @@ def _get_sugeridos_urls(db: Session, session_id: str) -> List[str]:
 
 def _append_sugeridos_urls(db: Session, session_id: str, nuevos: List[str]):
     prev = _get_sugeridos_urls(db, session_id)
-    combined = list(dict.fromkeys(prev + (nuevos or [])))
+    combined = list(dict.fromkeys(prev + nuevos))
     actualizar_pedido_por_sesion(db, session_id, "sugeridos", " ".join(combined))
 
 def _set_sugeridos_list(db: Session, session_id: str, lista: List[dict]):
@@ -809,8 +752,6 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
                     mensaje = sug2.get("mensaje")
 
     if productos:
-        # Inyectar tallas reales + limpiar
-        productos = _inject_real_sizes(productos)
         extras["productos_disponibles"] = productos
     elif mensaje:
         extras["mensaje_sugerencias"] = mensaje
@@ -832,9 +773,6 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
         "- 'finalize_order' -> args: {metodo_pago?, sucursal?}\n"
         "- 'remember_pref' -> args: {categoria?, talla?, color_favorito?}\n"
         "- 'cache_list' -> args: {productos: [ {nombre, url, precio, tallas_disponibles?} ... ]}\n\n"
-        "IMPORTANTES SOBRE TALLAS: si no conoces 'tallas_disponibles' de un producto, usa []. "
-        "Nunca inventes tallas ni coloques colores ahí. Evita duplicados."
-        "\n\n"
         "Si en Contexto_extra hay 'productos_disponibles', preséntalos (máx. 3) con formato '1. Nombre - $precio - URL' "
         "y añade 'cache_list' con los mismos elementos.\n"
         "Si hay 'mensaje_sugerencias', comunícalo brevemente y ofrece algo similar.\n"
@@ -901,6 +839,109 @@ def _formatear_sugerencias(lista: List[dict]) -> str:
         precio = f"${p['precio']:,}"
         lines.append(f"{i}. {p['nombre']} - {precio} - {p['url']}")
     return "Aquí tienes algunas opciones:\n" + "\n".join(lines)
+
+# --- Normalizadores y Action Protocol ---
+
+def _normalize_llm_actions(acciones):
+    norm = []
+    for a in (acciones or []):
+        if not isinstance(a, dict):
+            continue
+        if "tipo" in a and "args" in a:
+            if a.get("tipo") == "cache_list":
+                prods = (a.get("args") or {}).get("productos") or []
+                for p in prods:
+                    if isinstance(p, dict) and "tallas_disponibles" in p:
+                        p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
+            norm.append(a)
+            continue
+        for key in ("cache_list","add_item","update_qty","remove_item","show_cart","finalize_order","remember_pref"):
+            if key in a:
+                args = a.get(key) or {}
+                if key == "cache_list":
+                    prods = (args or {}).get("productos") or []
+                    for p in prods:
+                        if isinstance(p, dict) and "tallas_disponibles" in p:
+                            p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
+                norm.append({"tipo": key, "args": args})
+                break
+    return norm
+
+def _resolve_product_ref(db: Session, session_id: str, ref: str) -> Optional[dict]:
+    lista = _get_sugeridos_list(db, session_id) or []
+    if not ref:
+        return lista[0] if len(lista) == 1 else None
+    ref = str(ref).strip()
+    if ref.isdigit():
+        i = int(ref) - 1
+        if 0 <= i < len(lista):
+            return lista[i]
+    for p in lista:
+        if ref == p.get("url") or ref == p.get("sku") or ref.lower() == (p.get("nombre","").lower()):
+            return p
+    return None
+
+def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido) -> Optional[dict]:
+    if not isinstance(payload, dict) or "action" not in payload:
+        return None
+
+    action = payload.get("action")
+    if action == "SHOW_CART":
+        carrito = _carrito_load(pedido)
+        return {"response": "\n".join(_cart_summary_lines(carrito))}
+
+    if action == "ASK_VARIANT":
+        return {"response": payload.get("question") or "¿Cuál talla prefieres?"}
+
+    if action == "CLARIFY":
+        return {"response": payload.get("question") or "¿Podrías confirmar qué producto?"}
+
+    if action == "REMOVE_FROM_CART":
+        carrito = _carrito_load(pedido)
+        sku = str(payload.get("product_id") or "")
+        talla = payload.get("size")
+        color = payload.get("color")
+        carrito = _cart_remove(carrito, sku, talla, color)
+        _carrito_save(db, session_id, carrito)
+        try:
+            actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
+        except Exception:
+            pass
+        return {"response": "\n".join(_cart_summary_lines(carrito))}
+
+    if action == "ADD_TO_CART":
+        prod = _resolve_product_ref(db, session_id, payload.get("product_ref"))
+        if not prod:
+            lista = _get_sugeridos_list(db, session_id) or []
+            if len(lista) == 1:
+                prod = lista[0]
+            if not prod:
+                return {"response": "No identifiqué el producto. Dime el número de la opción (1, 2 o 3) o envíame el link."}
+
+        tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
+        size = payload.get("size")
+        if tallas and not size:
+            return {"response": f"Para agregar «{prod.get('nombre','Producto')}» necesito la talla: {', '.join(tallas)}. ¿Cuál prefieres?"}
+
+        carrito = _carrito_load(pedido)
+        carrito = _cart_add(
+            carrito,
+            sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
+            nombre=prod.get("nombre","Producto"),
+            categoria=prod.get("categoria",""),
+            talla=size,
+            color=payload.get("color") or prod.get("color"),
+            cantidad=int(payload.get("qty") or 1),
+            precio_unitario=float(prod.get("precio", 0.0)),
+        )
+        _carrito_save(db, session_id, carrito)
+        try:
+            actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
+        except Exception:
+            pass
+        return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
+
+    return None
 
 #  Endpoint conversación
 @app.post("/mensaje-whatsapp")
@@ -1150,7 +1191,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             urls_previas = _get_sugeridos_urls(db, session_id)
             res = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-            productos = _inject_real_sizes(res.get("productos", []))
+            productos = res.get("productos", [])
 
             if productos:
                 filtros = detectar_atributos(cat_txt) or {}
@@ -1171,7 +1212,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             if consulta:
                 urls_previas = _get_sugeridos_urls(db, session_id)
                 res = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-                productos = _inject_real_sizes(res.get("productos", []))
+                productos = res.get("productos", [])
                 if productos:
                     _set_sugeridos_list(db, session_id, productos)
                     _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
@@ -1207,11 +1248,11 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             urls_previas = _get_sugeridos_urls(db, session_id)
 
             res = sugerir_productos(consulta, limite=3, excluir_urls=urls_previas)
-            productos = _inject_real_sizes(res.get("productos", []))
+            productos = res.get("productos", [])
 
             if not productos:
                 res2 = sugerir_productos(ultima_cat, limite=3, excluir_urls=urls_previas)
-                productos = _inject_real_sizes(res2.get("productos", []))
+                productos = res2.get("productos", [])
 
             if productos:
                 filtros_persist = ult_filtros if isinstance(ult_filtros, dict) and ult_filtros else detectar_atributos(user_text)
@@ -1233,7 +1274,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             idx = int(num_txt) - 1
             lista = _get_sugeridos_list(db, session_id)
             if 0 <= idx < len(lista):
-                prod = dict(lista[idx])  # copia para enriquecer sin romper lista original
+                prod = lista[idx]
                 actualizar_pedido_por_sesion(db, session_id, "producto", prod.get("nombre", ""))
                 actualizar_pedido_por_sesion(db, session_id, "precio_unitario", prod.get("precio", 0.0))
                 if not getattr(pedido, "cantidad", 0):
@@ -1244,13 +1285,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 except Exception:
                     pass
 
-                # Si no hay tallas, intentamos traer desde Woo
                 tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
-                if not tallas and prod.get("url"):
-                    tallas = _clean_tallas(woo_tallas_from_url(prod["url"]))
-                    if tallas:
-                        prod["tallas_disponibles"] = tallas
-
                 if ADD_RE.search(user_text):
                     if tallas:
                         return {"response": f"Perfecto. Para agregar «{prod.get('nombre','Producto')}» necesito la talla: {', '.join(tallas)}. ¿Cuál prefieres?"}
@@ -1282,14 +1317,14 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     if any(pat in user_text for pat in PATRONES_RECHAZO):
         urls_previas = _get_sugeridos_urls(db, session_id)
         res = sugerir_productos(user_text, limite=3, excluir_urls=urls_previas)
-        productos = _inject_real_sizes(res.get("productos", []))
+        productos = res.get("productos", [])
 
         if len(productos) < 3:
             cat_relajada, _ = detectar_categoria(user_text)
             if cat_relajada:
                 res2 = sugerir_productos(cat_relajada, limite=3, excluir_urls=urls_previas)
                 ya = {p["url"] for p in productos}
-                productos += [p for p in _inject_real_sizes(res2.get("productos", [])) if p["url"] not in ya]
+                productos += [p for p in res2.get("productos", []) if p["url"] not in ya]
 
         if productos:
             try:
@@ -1331,10 +1366,20 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             else:
                 return {"response": "No tengo esa opción disponible. ¿Te muestro nuevas alternativas?"}
 
+    # ======= LLM =======
     resultado = await procesar_conversacion_llm(pedido, user_text)
+
+    # a) Soporte del Protocolo de Acciones (ADD_TO_CART / SHOW_CART / etc.)
+    handled = _handle_action_protocol(resultado, db, session_id, pedido)
+    if handled:
+        return handled
 
     if not isinstance(resultado, dict):
         return {"response": "Disculpa, ocurrió un error procesando tu solicitud. ¿Te muestro opciones de camisas o jeans?"}
+
+    # b) Normaliza acciones mal formadas y limpia tallas
+    if "acciones" in resultado:
+        resultado["acciones"] = _normalize_llm_actions(resultado["acciones"])
 
     acciones_llm = resultado.get("acciones", [])
     if not any((a.get("tipo") == "cache_list") for a in acciones_llm):
@@ -1348,7 +1393,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             if filtros.get("manga") in ("corta", "larga"):
                 partes.append(f"manga {filtros['manga']}")
             if filtros.get("color"):
-                partes.append(filtros["color"])
+                partes.append(f"color {filtros['color']}")
             if filtros.get("talla"):
                 partes.append(f"talla {filtros['talla']}")
             if filtros.get("uso"):
@@ -1357,7 +1402,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             consulta = " ".join(partes).strip()
             urls_previas = _get_sugeridos_urls(db, session_id)
             res_fallback = sugerir_productos(consulta or user_text, limite=12, excluir_urls=urls_previas)
-            productos = _inject_real_sizes(res_fallback.get("productos", []))
+            productos = res_fallback.get("productos", [])
 
             if productos:
                 print("[DBG] Fallback: forzando guardado de productos (no hubo cache_list)")
@@ -1417,9 +1462,11 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 elif t == "cache_list":
                     productos = args.get("productos") or []
                     if isinstance(productos, list) and productos:
+                        # Limpia tallas
+                        for p in productos:
+                            if isinstance(p, dict) and "tallas_disponibles" in p:
+                                p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                         try:
-                            # Inyectar tallas reales + limpiar ANTES de guardar
-                            productos = _inject_real_sizes(productos)
                             _set_sugeridos_list(db, session_id, productos)
                             _append_sugeridos_urls(
                                 db, session_id,
@@ -1446,8 +1493,11 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                                 consulta = " ".join([p for p in partes if p]).strip() or (user_text or "")
                                 urls_previas = _get_sugeridos_urls(db, session_id)
                                 res_plus = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-                                extra = _inject_real_sizes(res_plus.get("productos", []))
+                                extra = res_plus.get("productos", [])
                                 if extra:
+                                    for p in extra:
+                                        if isinstance(p, dict) and "tallas_disponibles" in p:
+                                            p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                                     ya = {p.get("url") for p in productos if isinstance(p, dict)}
                                     merged = productos + [e for e in extra if isinstance(e, dict) and e.get("url") not in ya]
                                     _set_sugeridos_list(db, session_id, merged)
@@ -1602,4 +1652,3 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
-
