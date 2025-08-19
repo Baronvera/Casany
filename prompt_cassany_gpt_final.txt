@@ -139,6 +139,21 @@ Siempre responde con un **único** JSON válido en el siguiente formato:
   "respuesta": "Texto de respuesta natural al cliente."
 }
 
+=== PROTOCOLO DE ACCIONES (OBLIGATORIO) ===
+Cuando el usuario pida operar el carrito (agregar, quitar, ver, cambiar talla), RESPONDE **SOLO** con JSON válido (sin texto extra), usando exactamente uno de:
+
+{"action":"ADD_TO_CART","product_ref":"<n|id|url>","size":null}
+{"action":"REMOVE_FROM_CART","product_id":123}
+{"action":"SHOW_CART"}
+{"action":"ASK_VARIANT","missing":"size"}  // si falta talla o variante
+{"action":"CLARIFY","question":"¿Cuál talla prefieres?"}
+
+- "product_ref": acepta el índice mostrado al usuario (1,2,3), el id del producto o su URL.
+- Si el producto requiere talla y el usuario no la dio, usa ASK_VARIANT.
+- Si el usuario menciona “agrega el 1” o “agrega el primero”, usa ADD_TO_CART con "product_ref":"1".
+- NUNCA mezcles texto humano con el JSON; la respuesta debe ser solo el JSON.
+
+
 ⚠️ IMPORTANTE:
 - Nunca uses `"add_item": { ... }` como clave directa; siempre usa `"tipo": "add_item"` y `"args": { ... }`.
 - Si no hay acciones, devuelve `"acciones": []`.
