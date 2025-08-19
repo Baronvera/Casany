@@ -1,4 +1,4 @@
-APP_BUILD = "build_04"
+APP_BUILD = "build_05"
 
 import os
 import json
@@ -59,6 +59,52 @@ try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 except ImportError:
     from backports.zoneinfo import ZoneInfo  # Python 3.8
+
+# --- WooCommerce (tallas reales) ---
+WOO_URL = (os.getenv("WOO_URL") or "").rstrip("/")
+WOO_KEY = os.getenv("WOO_CONSUMER_KEY")
+WOO_SECRET = os.getenv("WOO_CONSUMER_SECRET")
+
+def _woo_get(path, **params):
+    if not (WOO_URL and WOO_KEY and WOO_SECRET):
+        return []
+    try:
+        r = requests.get(
+            f"{WOO_URL}/wp-json/wc/v3/{path}",
+            params={"consumer_key": WOO_KEY, "consumer_secret": WOO_SECRET, **params},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return []
+
+def woo_product_from_url(url: str):
+    try:
+        slug = url.rstrip("/").split("/")[-1]
+        items = _woo_get("products", slug=slug, per_page=1)
+        return items[0] if items else None
+    except Exception:
+        return None
+
+def woo_tallas_from_url(url: str) -> List[str]:
+    p = woo_product_from_url(url)
+    if not p:
+        return []
+    # Variations only if variable product
+    if p.get("type") == "simple":
+        return []
+    vars_ = _woo_get(f"products/{p['id']}/variations", per_page=100)
+    tallas = set()
+    for v in vars_ or []:
+        if v.get("status") == "publish" and v.get("stock_status") == "instock":
+            for a in v.get("attributes", []):
+                n = (a.get("name") or "").lower()
+                if n in ("talla", "pa_talla", "size", "pa_size"):
+                    opt = str(a.get("option") or "").strip().upper()
+                    if opt:
+                        tallas.add(opt)
+    return sorted(tallas)
 
 # --- Zona horaria local (Bogotá) y helpers de tiempo/JSON ---
 LOCAL_TZ = ZoneInfo("America/Bogota")
@@ -156,6 +202,27 @@ CONFIRM_RE = re.compile(
     r'|(pedido|compra|orden).*(confirmar|confirmo|finalizar|cerrar|terminar|listo|realizar)',
     re.I
 )
+
+# Limpieza de tallas
+TALLAS_VALIDAS = {"XS","S","M","L","XL","XXL","28","30","32","34","36","38","40","42"}
+def _clean_tallas(arr: List[str]) -> List[str]:
+    return [
+        t for t in dict.fromkeys(str(t).strip().upper() for t in (arr or []))
+        if t in TALLAS_VALIDAS
+    ]
+
+def _inject_real_sizes(productos: List[dict]) -> List[dict]:
+    """Devuelve la misma lista pero con tallas_disponibles reales (Woo) y limpias."""
+    out = []
+    for p in productos or []:
+        p2 = dict(p)
+        tallas = []
+        url = p2.get("url")
+        if url:
+            tallas = woo_tallas_from_url(url)
+        p2["tallas_disponibles"] = _clean_tallas(tallas)
+        out.append(p2)
+    return out
 
 # ----- FastAPI app -----
 app = FastAPI()
@@ -302,7 +369,7 @@ PATRONES_RECHAZO = [
 
 def _has_column(db: Session, table: str, col: str) -> bool:
     try:
-        rows = db.execute(text(f"PRAGMA table_info({table})")).fetchall()
+        rows = db.execute(sa_text(f"PRAGMA table_info({table})")).fetchall()
         return any(r[1] == col for r in rows)
     except Exception:
         return False
@@ -311,7 +378,7 @@ def _ensure_column(col: str, ddl: str, table: str = "pedidos"):
     db = SessionLocal()
     try:
         if not _has_column(db, table, col):
-            db.execute(text(ddl))
+            db.execute(sa_text(ddl))
             db.commit()
     except Exception:
         db.rollback()
@@ -349,15 +416,15 @@ _ensure_column("filtros", "ALTER TABLE pedidos ADD COLUMN filtros TEXT")
 def _normalize_nulls():
     db = SessionLocal()
     try:
-        db.execute(text("UPDATE pedidos SET saludo_enviado=0 WHERE saludo_enviado IS NULL"))
-        db.execute(text("UPDATE pedidos SET datos_personales_advertidos=0 WHERE datos_personales_advertidos IS NULL"))
-        db.execute(text("UPDATE pedidos SET sugeridos='' WHERE sugeridos IS NULL"))
-        db.execute(text("UPDATE pedidos SET ultima_categoria='' WHERE ultima_categoria IS NULL"))
-        db.execute(text("UPDATE pedidos SET ultimos_filtros='' WHERE ultimos_filtros IS NULL"))
-        db.execute(text("UPDATE pedidos SET sugeridos_json='' WHERE sugeridos_json IS NULL"))
-        db.execute(text("UPDATE pedidos SET ctx_json='' WHERE ctx_json IS NULL"))
-        db.execute(text("UPDATE pedidos SET carrito_json='[]' WHERE carrito_json IS NULL"))
-        db.execute(text("UPDATE pedidos SET preferencias_json='{}' WHERE preferencias_json IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET saludo_enviado=0 WHERE saludo_enviado IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET datos_personales_advertidos=0 WHERE datos_personales_advertidos IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET sugeridos='' WHERE sugeridos IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET ultima_categoria='' WHERE ultima_categoria IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET ultimos_filtros='' WHERE ultimos_filtros IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET sugeridos_json='' WHERE sugeridos_json IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET ctx_json='' WHERE ctx_json IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET carrito_json='[]' WHERE carrito_json IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET preferencias_json='{}' WHERE preferencias_json IS NULL"))
         db.commit()
     except Exception:
         db.rollback()
@@ -368,14 +435,14 @@ _normalize_nulls()
 
 def _get_saludo_enviado(db: Session, session_id: str) -> int:
     try:
-        row = db.execute(text("SELECT saludo_enviado FROM pedidos WHERE session_id=:sid"), {"sid": session_id}).fetchone()
+        row = db.execute(sa_text("SELECT saludo_enviado FROM pedidos WHERE session_id=:sid"), {"sid": session_id}).fetchone()
         return int(row[0]) if row and row[0] else 0
     except Exception:
         return 0
 
 def _get_last_msg_id(db: Session, session_id: str) -> Optional[str]:
     try:
-        row = db.execute(text("SELECT last_msg_id FROM pedidos WHERE session_id=:sid"), {"sid": session_id}).fetchone()
+        row = db.execute(sa_text("SELECT last_msg_id FROM pedidos WHERE session_id=:sid"), {"sid": session_id}).fetchone()
         return row[0] if row and row[0] else None
     except Exception:
         return None
@@ -405,7 +472,7 @@ def get_user_filter(db: Session, session_id: str) -> Optional[dict]:
 def _get_sugeridos_urls(db: Session, session_id: str) -> List[str]:
     try:
         row = db.execute(
-            text("SELECT sugeridos FROM pedidos WHERE session_id=:sid"),
+            sa_text("SELECT sugeridos FROM pedidos WHERE session_id=:sid"),
             {"sid": session_id},
         ).fetchone()
         txt = row[0] if row and row[0] else ""
@@ -421,14 +488,14 @@ def _get_sugeridos_urls(db: Session, session_id: str) -> List[str]:
 
 def _append_sugeridos_urls(db: Session, session_id: str, nuevos: List[str]):
     prev = _get_sugeridos_urls(db, session_id)
-    combined = list(dict.fromkeys(prev + nuevos))
+    combined = list(dict.fromkeys(prev + (nuevos or [])))
     actualizar_pedido_por_sesion(db, session_id, "sugeridos", " ".join(combined))
 
 def _set_sugeridos_list(db: Session, session_id: str, lista: List[dict]):
     """Guarda la lista completa de sugeridos como JSON en `sugeridos_json`."""
     try:
         db.execute(
-            text("UPDATE pedidos SET sugeridos_json=:j WHERE session_id=:sid"),
+            sa_text("UPDATE pedidos SET sugeridos_json=:j WHERE session_id=:sid"),
             {"j": json.dumps(lista, ensure_ascii=False), "sid": session_id},
         )
         db.commit()
@@ -438,7 +505,7 @@ def _set_sugeridos_list(db: Session, session_id: str, lista: List[dict]):
 def _get_sugeridos_list(db: Session, session_id: str) -> List[dict]:
     try:
         row = db.execute(
-            text("SELECT sugeridos_json FROM pedidos WHERE session_id=:sid"),
+            sa_text("SELECT sugeridos_json FROM pedidos WHERE session_id=:sid"),
             {"sid": session_id},
         ).fetchone()
         return json.loads(row[0]) if row and row[0] else []
@@ -448,7 +515,7 @@ def _get_sugeridos_list(db: Session, session_id: str) -> List[dict]:
 def _get_ultima_cat_filters(db: Session, session_id: str):
     try:
         row = db.execute(
-            text("SELECT ultima_categoria, ultimos_filtros FROM pedidos WHERE session_id=:sid"),
+            sa_text("SELECT ultima_categoria, ultimos_filtros FROM pedidos WHERE session_id=:sid"),
             {"sid": session_id}
         ).fetchone()
         ultima_cat = row[0] if row and row[0] else None
@@ -466,7 +533,7 @@ def _ctx_load(pedido) -> dict:
         db = SessionLocal()
         try:
             row = db.execute(
-                text("SELECT ctx_json FROM pedidos WHERE session_id=:sid"),
+                sa_text("SELECT ctx_json FROM pedidos WHERE session_id=:sid"),
                 {"sid": sid},
             ).fetchone()
         finally:
@@ -479,7 +546,7 @@ def _ctx_load(pedido) -> dict:
 def _ctx_save(db: Session, session_id: str, ctx: dict):
     try:
         db.execute(
-            text("UPDATE pedidos SET ctx_json=:j WHERE session_id=:sid"),
+            sa_text("UPDATE pedidos SET ctx_json=:j WHERE session_id=:sid"),
             {"j": json.dumps(ctx, ensure_ascii=False), "sid": session_id},
         )
         db.commit()
@@ -490,7 +557,7 @@ def _remember_list(db: Session, session_id: str, cat: str, filtros: dict, produc
     """Guarda: categoría/filtros + lista COMPLETA (con SKU) en `sugeridos_json` y en ctx."""
     try:
         db.execute(
-            text("UPDATE pedidos SET ultima_categoria=:c, ultimos_filtros=:f, sugeridos_json=:s WHERE session_id=:sid"),
+            sa_text("UPDATE pedidos SET ultima_categoria=:c, ultimos_filtros=:f, sugeridos_json=:s WHERE session_id=:sid"),
             {
                 "c": cat or "",
                 "f": json.dumps(filtros, ensure_ascii=False),
@@ -547,7 +614,7 @@ def _carrito_load(pedido) -> list:
         db = SessionLocal()
         try:
             row = db.execute(
-                text("SELECT carrito_json FROM pedidos WHERE session_id=:sid"),
+                sa_text("SELECT carrito_json FROM pedidos WHERE session_id=:sid"),
                 {"sid": sid},
             ).fetchone()
         finally:
@@ -561,7 +628,7 @@ def _carrito_load(pedido) -> list:
 def _carrito_save(db: Session, session_id: str, carrito: list):
     try:
         db.execute(
-            text("UPDATE pedidos SET carrito_json=:j WHERE session_id=:sid"),
+            sa_text("UPDATE pedidos SET carrito_json=:j WHERE session_id=:sid"),
             {"j": json.dumps(carrito, ensure_ascii=False), "sid": session_id},
         )
         db.commit()
@@ -574,7 +641,7 @@ def _prefs_load(pedido) -> dict:
         db = SessionLocal()
         try:
             row = db.execute(
-                text("SELECT preferencias_json FROM pedidos WHERE session_id=:sid"),
+                sa_text("SELECT preferencias_json FROM pedidos WHERE session_id=:sid"),
                 {"sid": sid},
             ).fetchone()
         finally:
@@ -588,7 +655,7 @@ def _prefs_load(pedido) -> dict:
 def _prefs_save(db: Session, session_id: str, prefs: dict):
     try:
         db.execute(
-            text("UPDATE pedidos SET preferencias_json=:j WHERE session_id=:sid"),
+            sa_text("UPDATE pedidos SET preferencias_json=:j WHERE session_id=:sid"),
             {"j": json.dumps(prefs, ensure_ascii=False), "sid": session_id},
         )
         db.commit()
@@ -742,6 +809,8 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
                     mensaje = sug2.get("mensaje")
 
     if productos:
+        # Inyectar tallas reales + limpiar
+        productos = _inject_real_sizes(productos)
         extras["productos_disponibles"] = productos
     elif mensaje:
         extras["mensaje_sugerencias"] = mensaje
@@ -763,6 +832,9 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
         "- 'finalize_order' -> args: {metodo_pago?, sucursal?}\n"
         "- 'remember_pref' -> args: {categoria?, talla?, color_favorito?}\n"
         "- 'cache_list' -> args: {productos: [ {nombre, url, precio, tallas_disponibles?} ... ]}\n\n"
+        "IMPORTANTES SOBRE TALLAS: si no conoces 'tallas_disponibles' de un producto, usa []. "
+        "Nunca inventes tallas ni coloques colores ahí. Evita duplicados."
+        "\n\n"
         "Si en Contexto_extra hay 'productos_disponibles', preséntalos (máx. 3) con formato '1. Nombre - $precio - URL' "
         "y añade 'cache_list' con los mismos elementos.\n"
         "Si hay 'mensaje_sugerencias', comunícalo brevemente y ofrece algo similar.\n"
@@ -870,20 +942,20 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     last_act_utc = _to_utc(getattr(pedido, "last_activity", None))
     tiempo_inactivo = ahora - last_act_utc
 
-    text = user_input.message.strip().lower()
+    user_text = user_input.message.strip().lower()
     actualizar_pedido_por_sesion(db, session_id, "last_activity", ahora)
 
     filtros_detectados = {}
-    m_color = COLOR_RE.search(text)
+    m_color = COLOR_RE.search(user_text)
     if m_color:
         filtros_detectados["color"] = m_color.group(1).lower()
-    m_talla = TALLA_RE.search(text)
+    m_talla = TALLA_RE.search(user_text)
     if m_talla:
         filtros_detectados["talla"] = m_talla.group(1).upper() if m_talla.lastindex else m_talla.group(0).upper()
-    m_manga = MANGA_RE.search(text)
+    m_manga = MANGA_RE.search(user_text)
     if m_manga:
         filtros_detectados["manga"] = m_manga.group(1).lower()
-    m_uso = USO_RE.search(text)
+    m_uso = USO_RE.search(user_text)
     if m_uso:
         filtros_detectados["uso"] = m_uso.group(1).lower()
 
@@ -925,7 +997,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         actualizar_pedido_por_sesion(db, session_id, "telefono", telefono_cliente)
 
     if pedido and pedido.estado == "cancelado":
-        if re.match(r'^(hola|buen(?:o|a)s? días?|buenas tardes|buenas noches|hey)\b', text):
+        if re.match(r'^(hola|buen(?:o|a)s? días?|buenas tardes|buenas noches|hey)\b', user_text):
             db.query(Pedido).filter(Pedido.session_id == session_id).delete()
             db.commit()
             crear_pedido(db, {
@@ -970,7 +1042,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             )
         }
 
-    if detectar_intencion_atencion(text):
+    if detectar_intencion_atencion(user_text):
         mensaje_alerta = generar_mensaje_atencion_humana(pedido)
         await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
         return {
@@ -980,7 +1052,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             )
         }
 
-    if any(neg in text for neg in ["ya no quiero", "cancelar pedido", "no deseo", "me arrepentí"]):
+    if any(neg in user_text for neg in ["ya no quiero", "cancelar pedido", "no deseo", "me arrepentí"]):
         producto_cancelado = pedido.producto or "el pedido actual"
         actualizar_pedido_por_sesion(db, session_id, "estado", "cancelado")
         actualizar_pedido_por_sesion(db, session_id, "producto", "")
@@ -992,7 +1064,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             "response": f"Entiendo, he cancelado {producto_cancelado}. ¿Te gustaría ver otra prenda o necesitas ayuda con algo más?"
         }
 
-    if SALUDO_RE.match(text):
+    if SALUDO_RE.match(user_text):
         if _get_saludo_enviado(db, session_id) == 0:
             actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
             return {
@@ -1010,7 +1082,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             }
         return {"response": "¡Hola! ¿Qué te gustaría ver hoy: camisas, jeans, pantalones o suéteres?"}
 
-    if DOMICILIO_RE.search(text):
+    if DOMICILIO_RE.search(user_text):
         actualizar_pedido_por_sesion(db, session_id, "metodo_entrega", "domicilio")
         if not getattr(pedido, "datos_personales_advertidos", False):
             actualizar_pedido_por_sesion(db, session_id, "datos_personales_advertidos", True)
@@ -1024,12 +1096,12 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             }
         return {"response": "Perfecto, por favor indícame tu dirección y ciudad para el envío."}
 
-    if RECOGER_RE.search(text):
+    if RECOGER_RE.search(user_text):
         actualizar_pedido_por_sesion(db, session_id, "metodo_entrega", "recoger_en_tienda")
         tiendas = "\n".join(PUNTOS_VENTA)
         return {"response": f"Por favor, confirma en cuál de nuestras tiendas deseas recoger tu pedido:\n{tiendas}"}
 
-    if SMALLTALK_RE.search(text):
+    if SMALLTALK_RE.search(user_text):
         cats = ", ".join(CATEGORIAS_RESUMEN[:4]) + "…"
         return {
             "response": (
@@ -1038,7 +1110,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             )
         }
 
-    if OFFTOPIC_RE.search(text):
+    if OFFTOPIC_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
         return {
             "response": (
@@ -1049,7 +1121,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             )
         }
 
-    if DISCOVERY_RE.search(text):
+    if DISCOVERY_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
         return {
             "response": (
@@ -1062,14 +1134,14 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             )
         }
 
-    if CARRO_RE.search(text):
+    if CARRO_RE.search(user_text):
         carrito = _carrito_load(pedido)
         lineas = _cart_summary_lines(carrito)
         return {"response": "\n".join(lineas)}
 
-    m_fotos = FOTOS_RE.search(text)
+    m_fotos = FOTOS_RE.search(user_text)
     if m_fotos:
-        if _tiene_atributos_especificos(text):
+        if _tiene_atributos_especificos(user_text):
             pass
         else:
             cat_txt = m_fotos.group(2).strip()
@@ -1078,7 +1150,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             urls_previas = _get_sugeridos_urls(db, session_id)
             res = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-            productos = res.get("productos", [])
+            productos = _inject_real_sizes(res.get("productos", []))
 
             if productos:
                 filtros = detectar_atributos(cat_txt) or {}
@@ -1089,17 +1161,17 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
             return {"response": f"No hay stock para «{cat_txt}» en este momento. ¿Te muestro algo de:\n{cats}"}
 
-    if MOSTRAR_RE.search(text):
-        if _tiene_atributos_especificos(text):
+    if MOSTRAR_RE.search(user_text):
+        if _tiene_atributos_especificos(user_text):
             pass
         else:
             ultima_cat, _ = _get_ultima_cat_filters(db, session_id)
-            cat, _ = detectar_categoria(text)
+            cat, _ = detectar_categoria(user_text)
             consulta = cat or ultima_cat
             if consulta:
                 urls_previas = _get_sugeridos_urls(db, session_id)
                 res = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-                productos = res.get("productos", [])
+                productos = _inject_real_sizes(res.get("productos", []))
                 if productos:
                     _set_sugeridos_list(db, session_id, productos)
                     _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
@@ -1107,7 +1179,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
             return {"response": f"¿Qué te muestro primero?\n{cats}"}
 
-    if MAS_OPCIONES_RE.search(text):
+    if MAS_OPCIONES_RE.search(user_text):
         productos_previos = _get_sugeridos_list(db, session_id)
         if productos_previos:
             restantes = productos_previos[3:] if len(productos_previos) > 3 else []
@@ -1120,7 +1192,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
         ultima_cat, ult_filtros = _get_ultima_cat_filters(db, session_id)
         if not ultima_cat:
-            ultima_cat, _ = detectar_categoria(text)
+            ultima_cat, _ = detectar_categoria(user_text)
 
         if ultima_cat:
             partes = [ultima_cat]
@@ -1135,14 +1207,14 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             urls_previas = _get_sugeridos_urls(db, session_id)
 
             res = sugerir_productos(consulta, limite=3, excluir_urls=urls_previas)
-            productos = res.get("productos", [])
+            productos = _inject_real_sizes(res.get("productos", []))
 
             if not productos:
                 res2 = sugerir_productos(ultima_cat, limite=3, excluir_urls=urls_previas)
-                productos = res2.get("productos", [])
+                productos = _inject_real_sizes(res2.get("productos", []))
 
             if productos:
-                filtros_persist = ult_filtros if isinstance(ult_filtros, dict) and ult_filtros else detectar_atributos(text)
+                filtros_persist = ult_filtros if isinstance(ult_filtros, dict) and ult_filtros else detectar_atributos(user_text)
                 _remember_list(db, session_id, ultima_cat, filtros_persist, productos)
                 _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
                 return {"response": _formatear_sugerencias(productos)}
@@ -1154,14 +1226,14 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
         return {"response": f"No detecté ninguna categoría concreta en tu solicitud. ¿Te gustaría que te muestre opciones de:\n{cats}"}
 
-    m_sel = SELECCION_RE.search(text)
+    m_sel = SELECCION_RE.search(user_text)
     if m_sel:
         num_txt = next((g for g in m_sel.groups() if g), None)
         if num_txt:
             idx = int(num_txt) - 1
             lista = _get_sugeridos_list(db, session_id)
             if 0 <= idx < len(lista):
-                prod = lista[idx]
+                prod = dict(lista[idx])  # copia para enriquecer sin romper lista original
                 actualizar_pedido_por_sesion(db, session_id, "producto", prod.get("nombre", ""))
                 actualizar_pedido_por_sesion(db, session_id, "precio_unitario", prod.get("precio", 0.0))
                 if not getattr(pedido, "cantidad", 0):
@@ -1172,8 +1244,14 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 except Exception:
                     pass
 
-                tallas = prod.get("tallas_disponibles") or []
-                if ADD_RE.search(text):
+                # Si no hay tallas, intentamos traer desde Woo
+                tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
+                if not tallas and prod.get("url"):
+                    tallas = _clean_tallas(woo_tallas_from_url(prod["url"]))
+                    if tallas:
+                        prod["tallas_disponibles"] = tallas
+
+                if ADD_RE.search(user_text):
                     if tallas:
                         return {"response": f"Perfecto. Para agregar «{prod.get('nombre','Producto')}» necesito la talla: {', '.join(tallas)}. ¿Cuál prefieres?"}
                     carrito = _carrito_load(pedido)
@@ -1201,22 +1279,22 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             if lista:
                 return {"response": f"Por favor indícame un número entre 1 y {len(lista)} de la lista que te mostré."}
 
-    if any(pat in text for pat in PATRONES_RECHAZO):
+    if any(pat in user_text for pat in PATRONES_RECHAZO):
         urls_previas = _get_sugeridos_urls(db, session_id)
-        res = sugerir_productos(text, limite=3, excluir_urls=urls_previas)
-        productos = res.get("productos", [])
+        res = sugerir_productos(user_text, limite=3, excluir_urls=urls_previas)
+        productos = _inject_real_sizes(res.get("productos", []))
 
         if len(productos) < 3:
-            cat_relajada, _ = detectar_categoria(text)
+            cat_relajada, _ = detectar_categoria(user_text)
             if cat_relajada:
                 res2 = sugerir_productos(cat_relajada, limite=3, excluir_urls=urls_previas)
                 ya = {p["url"] for p in productos}
-                productos += [p for p in res2.get("productos", []) if p["url"] not in ya]
+                productos += [p for p in _inject_real_sizes(res2.get("productos", [])) if p["url"] not in ya]
 
         if productos:
             try:
-                cat_local, _ = detectar_categoria(text)
-                filtros = detectar_atributos(text)
+                cat_local, _ = detectar_categoria(user_text)
+                filtros = detectar_atributos(user_text)
                 actualizar_pedido_por_sesion(db, session_id, "ultima_categoria", cat_local or "")
                 actualizar_pedido_por_sesion(db, session_id, "ultimos_filtros", json.dumps(filtros, ensure_ascii=False))
                 _set_sugeridos_list(db, session_id, productos)
@@ -1229,7 +1307,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             msg = res.get("mensaje") or "No encontré opciones que cumplan lo que pides. ¿Te muestro algo similar?"
             return {"response": msg}
 
-    m = SELECCION_RE.search(text)
+    m = SELECCION_RE.search(user_text)
     if m:
         idx_str = next((g for g in m.groups() if g), None)
         try:
@@ -1239,7 +1317,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
         if idx is not None:
             lista = _get_sugeridos_list(db, session_id)
-            if lista and 1 <= idx <= len(lista):
+            if lista && 1 <= idx <= len(lista):
                 prod = lista[idx - 1]
                 _remember_selection(db, session_id, prod, idx)
                 actualizar_pedido_por_sesion(db, session_id, "producto", prod.get("nombre", ""))
@@ -1253,7 +1331,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             else:
                 return {"response": "No tengo esa opción disponible. ¿Te muestro nuevas alternativas?"}
 
-    resultado = await procesar_conversacion_llm(pedido, text)
+    resultado = await procesar_conversacion_llm(pedido, user_text)
 
     if not isinstance(resultado, dict):
         return {"response": "Disculpa, ocurrió un error procesando tu solicitud. ¿Te muestro opciones de camisas o jeans?"}
@@ -1262,8 +1340,8 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     if not any((a.get("tipo") == "cache_list") for a in acciones_llm):
         productos_previos = _get_sugeridos_list(db, session_id)
         if not productos_previos:
-            categoria_detectada, _ = detectar_categoria(text)
-            filtros = detectar_atributos(text)
+            categoria_detectada, _ = detectar_categoria(user_text)
+            filtros = detectar_atributos(user_text)
             partes = [categoria_detectada] if categoria_detectada else []
             if filtros.get("subtipo") == "guayabera":
                 partes.append("guayabera")
@@ -1278,8 +1356,8 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             consulta = " ".join(partes).strip()
             urls_previas = _get_sugeridos_urls(db, session_id)
-            res_fallback = sugerir_productos(consulta or text, limite=12, excluir_urls=urls_previas)
-            productos = res_fallback.get("productos", [])
+            res_fallback = sugerir_productos(consulta or user_text, limite=12, excluir_urls=urls_previas)
+            productos = _inject_real_sizes(res_fallback.get("productos", []))
 
             if productos:
                 print("[DBG] Fallback: forzando guardado de productos (no hubo cache_list)")
@@ -1340,6 +1418,8 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                     productos = args.get("productos") or []
                     if isinstance(productos, list) and productos:
                         try:
+                            # Inyectar tallas reales + limpiar ANTES de guardar
+                            productos = _inject_real_sizes(productos)
                             _set_sugeridos_list(db, session_id, productos)
                             _append_sugeridos_urls(
                                 db, session_id,
@@ -1348,7 +1428,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                             if len(productos) <= 3:
                                 ultima_cat, ult_filtros = _get_ultima_cat_filters(db, session_id)
                                 if not ultima_cat:
-                                    ultima_cat, _ = detectar_categoria(text)
+                                    ultima_cat, _ = detectar_categoria(user_text)
 
                                 partes = [ultima_cat] if ultima_cat else []
                                 if isinstance(ult_filtros, dict):
@@ -1363,10 +1443,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                                     if ult_filtros.get("talla"):
                                         partes.append(f"talla {ult_filtros['talla']}")
 
-                                consulta = " ".join([p for p in partes if p]).strip() or (text or "")
+                                consulta = " ".join([p for p in partes if p]).strip() or (user_text or "")
                                 urls_previas = _get_sugeridos_urls(db, session_id)
                                 res_plus = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-                                extra = res_plus.get("productos", [])
+                                extra = _inject_real_sizes(res_plus.get("productos", []))
                                 if extra:
                                     ya = {p.get("url") for p in productos if isinstance(p, dict)}
                                     merged = productos + [e for e in extra if isinstance(e, dict) and e.get("url") not in ya]
@@ -1522,4 +1602,3 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
-
