@@ -24,6 +24,7 @@ from hubspot_utils import enviar_pedido_a_hubspot
 from utils_intencion import detectar_intencion_atencion
 from utils_mensaje_whatsapp import generar_mensaje_atencion_humana
 from woocommerce_gpt_utils import sugerir_productos, detectar_categoria, detectar_atributos
+
 #  Configuración y cliente OpenAI
 load_dotenv(override=True)
 
@@ -130,6 +131,8 @@ MAS_OPCIONES_RE = re.compile(r'\b(más opciones|mas opciones|muéstrame más|mue
 DOMICILIO_RE = re.compile(r'\b(a\s*domicilio|env[ií]o\s*a\s*domicilio|domicilio)\b', re.I)
 RECOGER_RE  = re.compile(r'\b(recoger(?:lo)?\s+en\s+(tienda|sucursal)|retiro\s+en\s+tienda)\b', re.I)
 SELECCION_RE = re.compile(r'(?:opci(?:o|ó)n\s*(\d+))|(?:\bla\s*(\d+)\b)|(?:n[uú]mero\s*(\d+))|^(?:\s*)(\d+)(?:\s*)$', re.I)
+# Pedidos de agregar al carrito
+ADD_RE = re.compile(r'\b(agrega|agregar|añade|añadir|mete|pon(?:er)?|suma|agregalo|agregá|agregame)\b', re.I)
 # Preguntas generales / off-topic que debemos redirigir a venta
 OFFTOPIC_RE = re.compile(
     r"(qué\s+vend[eé]n?|que\s+vend[eé]n?|qué\s+es\s+cassany|qu[eé]\s+es\s+cassany|"
@@ -165,6 +168,7 @@ CONFIRM_RE = re.compile(
     r'|(pedido|compra|orden).*(confirmar|confirmo|finalizar|cerrar|terminar|listo|realizar)',
     re.I
 )
+
 async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
     # 👉 Pago / Confirmación (router híbrido: regex -> LLM clasificador)
     # 1) Intento barato (regex)
@@ -522,22 +526,14 @@ def _ctx_save(db: Session, session_id: str, ctx: dict):
         db.rollback()
 
 def _remember_list(db: Session, session_id: str, cat: str, filtros: dict, productos: List[dict]):
-    """Guarda: categoría/filtros detectados + última lista completa de sugeridos."""
-    lista_ctx = []
-    for p in productos:
-        lista_ctx.append({
-            "nombre": p.get("nombre"),
-            "url": p.get("url"),
-            "precio": p.get("precio"),
-            "tallas_disponibles": p.get("tallas_disponibles", []),
-        })
+    """Guarda: categoría/filtros + lista COMPLETA de sugeridos (no recortar claves)."""
     try:
         db.execute(
             text("UPDATE pedidos SET ultima_categoria=:c, ultimos_filtros=:f, sugeridos_json=:s WHERE session_id=:sid"),
             {
                 "c": cat or "",
                 "f": json.dumps(filtros, ensure_ascii=False),
-                "s": json.dumps(lista_ctx, ensure_ascii=False),
+                "s": json.dumps(productos, ensure_ascii=False),  # guarda objetos completos (incluye sku)
                 "sid": session_id,
             },
         )
@@ -545,11 +541,12 @@ def _remember_list(db: Session, session_id: str, cat: str, filtros: dict, produc
     except Exception:
         db.rollback()
 
+    # espejo en ctx (opcional)
     pedido = obtener_pedido_por_sesion(db, session_id)
     ctx = _ctx_load(pedido)
     ctx["ultima_categoria"] = cat
     ctx["ultimos_filtros"] = filtros
-    ctx["ultima_lista"] = lista_ctx
+    ctx["ultima_lista"] = productos
     _ctx_save(db, session_id, ctx)
 
 def _remember_selection(db: Session, session_id: str, prod: dict, idx: int):
@@ -684,6 +681,21 @@ def _cart_summary_lines(carrito: list) -> List[str]:
 #  Prompt maestro
 with open("prompt_cassany_gpt_final.txt", "r", encoding="utf-8") as fh:
     base_prompt = fh.read().strip()
+
+# 👇 NUEVO: protocolo para obligar acciones de carrito en JSON
+ACTIONS_PROTOCOL = """
+=== PROTOCOLO DE ACCIONES (OBLIGATORIO) ===
+Cuando el usuario pida operar el carrito (agregar, quitar, ver, cambiar talla), RESPONDE SOLO con JSON válido (sin texto extra) usando exactamente uno de:
+{"action":"ADD_TO_CART","product_ref":"<n|id|url>","size":null}
+{"action":"REMOVE_FROM_CART","product_id":123}
+{"action":"SHOW_CART"}
+{"action":"ASK_VARIANT","missing":"size"}
+{"action":"CLARIFY","question":"¿Cuál talla prefieres?"}
+- "product_ref": acepta el índice mostrado al usuario (1,2,3), el id del producto o su URL.
+- Si el producto requiere talla y el usuario no la dio, usa ASK_VARIANT.
+- Si el usuario dice “agrega el 1”, usa {"action":"ADD_TO_CART","product_ref":"1"}.
+- NUNCA mezcles texto humano con el JSON; la respuesta debe ser solo el JSON.
+""".strip()
 
 #  Pydantic models
 class UserMessage(BaseModel):
@@ -852,13 +864,13 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
     else:
         print("[DBG] NO HAY PRODUCTOS DISPONIBLES")
 
-
     try:
         completion = client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": base_prompt},
                 {"role": "system", "content": instruct_json},
+                {"role": "system", "content": ACTIONS_PROTOCOL},   # 👈 NUEVO
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.4,           # un poco más bajo para respuestas más consistentes
@@ -1159,7 +1171,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         lineas = _cart_summary_lines(carrito)
         return {"response": "\n".join(lineas)}
 
-# 👉 "Fotos de <categoría>" → prioriza LLM si hay atributos; si no, handler rápido
+    # 👉 "Fotos de <categoría>" → prioriza LLM si hay atributos; si no, handler rápido
     m_fotos = FOTOS_RE.search(text)
     if m_fotos:
         # Si el usuario especifica atributos (manga, color, talla, uso), NO listamos aquí:
@@ -1190,7 +1202,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             return {"response": f"No hay stock para «{cat_txt}» en este momento. ¿Te muestro algo de:\n{cats}"}
 
 
-# 👉 “Muéstrame / puedes mostrarme / quiero ver …”
+    # 👉 “Muéstrame / puedes mostrarme / quiero ver …”
     if MOSTRAR_RE.search(text):
         # ⛔️ Si el usuario especifica atributos (color, manga, talla, uso), NO respondas aquí.
         # Deja que el LLM procese para respetar los filtros y devolver acciones (add_item, cache_list, etc.)
@@ -1290,6 +1302,29 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                     pass
 
                 tallas = prod.get("tallas_disponibles") or []
+                # 👇 NUEVO: si el usuario pidió "agrega...", agregamos directo (pidiendo talla si hace falta)
+                if ADD_RE.search(text):
+                    if tallas:
+                        return {"response": f"Perfecto. Para agregar «{prod.get('nombre','Producto')}» necesito la talla: {', '.join(tallas)}. ¿Cuál prefieres?"}
+                    carrito = _carrito_load(pedido)
+                    carrito = _cart_add(
+                        carrito,
+                        sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
+                        nombre=prod.get("nombre","Producto"),
+                        categoria=prod.get("categoria",""),
+                        talla=None,
+                        color=prod.get("color"),
+                        cantidad=1,
+                        precio_unitario=float(prod.get("precio", 0.0))
+                    )
+                    _carrito_save(db, session_id, carrito)
+                    try:
+                        actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
+                    except Exception:
+                        pass
+                    lineas = _cart_summary_lines(carrito)
+                    return {"response": "Agregado al carrito ✅\n\n" + "\n".join(lineas)}
+
                 if tallas:
                     return {"response": f"Listo, seleccionaste la opción {idx+1}. Tallas disponibles: {', '.join(tallas)}. ¿Cuál prefieres?"}
                 return {"response": f"Listo, seleccionaste la opción {idx+1}. ¿Cuántas unidades deseas?"}
@@ -1361,7 +1396,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     if not isinstance(resultado, dict):
         return {"response": "Disculpa, ocurrió un error procesando tu solicitud. ¿Te muestro opciones de camisas o jeans?"}
     
-# 🩹 Fallback por si el LLM no devuelve acción 'cache_list'
+    # 🩹 Fallback por si el LLM no devuelve acción 'cache_list'
     acciones_llm = resultado.get("acciones", [])
     if not any((a.get("tipo") == "cache_list") for a in acciones_llm):
         productos_previos = _get_sugeridos_list(db, session_id)
@@ -1389,18 +1424,13 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             if productos:
                 print("[DBG] Fallback: forzando guardado de productos (no hubo cache_list)")
-                _remember_list(db, session_id, categoria_detectada, filtros, productos)  # guarda TODO
+                _remember_list(db, session_id, categoria_detectada or "", filtros or {}, productos)  # guarda TODO
                 _append_sugeridos_urls(db, session_id, [p["url"] for p in productos if "url" in p])
 
                 # Si el LLM no envió cache_list pero el fallback encontró productos,
-    # sobrescribimos la respuesta "no hay stock" con una lista corta útil.
-    if not any((a.get("tipo") == "cache_list") for a in resultado.get("acciones", [])):
-        lista_guardada = _get_sugeridos_list(db, session_id)
-        if lista_guardada:
-            print("[DBG] overwrite: usando lista fallback para respuesta")
-            resultado["respuesta"] = _formatear_sugerencias(lista_guardada[:3]) + \
-                "\n¿Te muestro más opciones o agrego alguna al carrito?"
-
+                # sobrescribimos la respuesta "no hay stock" con una lista corta útil.
+                resultado["respuesta"] = _formatear_sugerencias(productos[:3]) + \
+                    "\n¿Te muestro más opciones o agrego alguna al carrito?"
 
     # 👉 Ejecutar acciones solicitadas por el LLM (carrito/memoria/checkout/cache_list)
     acciones = resultado.get("acciones") or []
@@ -1582,7 +1612,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
 # ------------------ Verificación del webhook (GET) ------------------
 @app.get("/webhook")
-
 def root():
     return {"ok": True, "service": "cassany", "build": APP_BUILD, "docs": "/docs"}
 
@@ -1665,6 +1694,3 @@ async def test_whatsapp():
 
 
 init_db()
-
-
-
