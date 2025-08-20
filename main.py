@@ -775,7 +775,7 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
     elif mensaje:
         extras["mensaje_sugerencias"] = mensaje
 
-    if estado["metodo_entrega"] == "recoger_en_tienda" y not estado["punto_venta"]:
+    if estado["metodo_entrega"] == "recoger_en_tienda" and not estado["punto_venta"]:
         extras["puntos_venta"] = PUNTOS_VENTA
 
     instruct_json = (
@@ -1513,7 +1513,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             consulta = " ".join(partes).strip()
             urls_previas = _get_sugeridos_urls(db, session_id)
-            res_fallback = sugerir_productos(consulta o user_text, limite=12, excluir_urls=urls_previas)
+            res_fallback = sugerir_productos(consulta or user_text, limite=12, excluir_urls=urls_previas)
             productos = res_fallback.get("productos", [])
 
             if productos:
@@ -1764,3 +1764,4 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
