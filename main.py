@@ -928,56 +928,27 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
         return {"response": "\n".join(_cart_summary_lines(carrito))}
 
     if action == "ASK_VARIANT":
-    ref = payload.get("product_ref")
-    prod = _resolve_product_ref(db, session_id, ref) if ref else None
-    if prod:
-        # Guarda el pendiente en el contexto
-        ctx = _ctx_load(pedido)
-        ctx["pending_variant"] = {
-            "ref": ref,
-            "sku": prod.get("sku") or prod.get("url") or prod.get("nombre"),
-            "qty": int(payload.get("qty") or 1),
-        }
-        _ctx_save(db, session_id, ctx)
+        ref = payload.get("product_ref")
+        prod = _resolve_product_ref(db, session_id, ref) if ref else None
+        if prod:
+            # Guarda el pendiente en el contexto
+            ctx = _ctx_load(pedido)
+            ctx["pending_variant"] = {
+                "ref": ref,
+                "sku": prod.get("sku") or prod.get("url") or prod.get("nombre"),
+                "qty": int(payload.get("qty") or 1),
+            }
+            _ctx_save(db, session_id, ctx)
 
-        tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
-        if tallas:
-            return {"response": f"Para «{prod.get('nombre','Producto')}», ¿qué talla prefieres? Opciones: {', '.join(tallas)}"}
-        return {"response": "¿Qué talla prefieres?"}
-    # Si no sabemos el producto, pedimos aclaración
-    return {"response": "¿De cuál producto necesitas la talla? Indícame el número (1, 2 o 3) o envíame el enlace."}
-
+            tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
+            if tallas:
+                return {"response": f"Para «{prod.get('nombre','Producto')}», ¿qué talla prefieres? Opciones: {', '.join(tallas)}"}
+            return {"response": "¿Qué talla prefieres?"}
+        # Si no sabemos el producto, pedimos aclaración
+        return {"response": "¿De cuál producto necesitas la talla? Indícame el número (1, 2 o 3) o envíame el enlace."}
 
     if action == "CLARIFY":
         return {"response": payload.get("question") or "¿Podrías confirmar qué producto?"}
-
-    if "talla" in filtros_detectados:
-    ctx = _ctx_load(pedido)
-    pv = ctx.get("pending_variant")
-    if pv:
-        prod = _resolve_product_ref(db, session_id, pv.get("ref") or pv.get("sku"))
-        if prod:
-            carrito = _carrito_load(pedido)
-            carrito = _cart_add(
-                carrito,
-                sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
-                nombre=prod.get("nombre","Producto"),
-                categoria=prod.get("categoria",""),
-                talla=filtros_detectados["talla"],
-                color=prod.get("color"),
-                cantidad=int(pv.get("qty") or 1),
-                precio_unitario=float(prod.get("precio", 0.0)),
-            )
-            _carrito_save(db, session_id, carrito)
-            try:
-                actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
-            except Exception:
-                pass
-            # Limpia el pendiente
-            ctx.pop("pending_variant", None)
-            _ctx_save(db, session_id, ctx)
-
-            return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
     if action == "REMOVE_FROM_CART":
         carrito = _carrito_load(pedido)
@@ -1093,6 +1064,34 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         print("[DBG] Guardando filtros:", filtros_detectados)
         set_user_filter(db, session_id, filtros_detectados)
 
+    # ✅ Si llegó talla y hay un producto pendiente (ASK_VARIANT), agréguelo al carrito
+    if "talla" in filtros_detectados:
+        ctx = _ctx_load(pedido)
+        pv = ctx.get("pending_variant")
+        if pv:
+            prod = _resolve_product_ref(db, session_id, pv.get("ref") or pv.get("sku"))
+            if prod:
+                carrito = _carrito_load(pedido)
+                carrito = _cart_add(
+                    carrito,
+                    sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
+                    nombre=prod.get("nombre","Producto"),
+                    categoria=prod.get("categoria",""),
+                    talla=filtros_detectados["talla"],
+                    color=prod.get("color"),
+                    cantidad=int(pv.get("qty") or 1),
+                    precio_unitario=float(prod.get("precio", 0.0)),
+                )
+                _carrito_save(db, session_id, carrito)
+                try:
+                    actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
+                except Exception:
+                    pass
+                # Limpia el pendiente
+                ctx.pop("pending_variant", None)
+                _ctx_save(db, session_id, ctx)
+                return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
+
     # ✅ Fast-path: “talla L” (o 38) para la última selección
     m_talla_solo = TALLA_TOKEN_RE.search(user_text)
     if m_talla_solo and not MOSTRAR_RE.search(user_text) and not SELECCION_RE.search(user_text) and not ORDINAL_RE.search(user_text):
@@ -1123,6 +1122,11 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 except Exception:
                     pass
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
+
+    # Manejo prioritario de pago / confirmación
+    resp_pago = await procesar_mensaje_usuario(user_text, db, session_id, pedido)
+    if resp_pago:
+        return resp_pago
 
     if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
         db.query(Pedido).filter(Pedido.session_id == session_id).delete()
@@ -1812,6 +1816,3 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
-
-
-
