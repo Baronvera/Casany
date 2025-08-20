@@ -301,7 +301,7 @@ async def detectar_intencion_pago_confirmacion(texto: str) -> dict:
         )
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
-            temperature=0,6,
+            temperature=0.6,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": schema_msg},
@@ -1883,6 +1883,7 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
 
 
 
