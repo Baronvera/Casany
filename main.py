@@ -1109,7 +1109,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         telefono_cliente = session_id.replace("cliente_", "")
         actualizar_pedido_por_sesion(db, session_id, "telefono", telefono_cliente)
 
-    if pedido y pedido.estado == "cancelado":
+    if pedido and pedido.estado == "cancelado":
         if re.match(r'^(hola|buen(?:o|a)s? días?|buenas tardes|buenas noches|hey)\b', user_text):
             db.query(Pedido).filter(Pedido.session_id == session_id).delete()
             db.commit()
@@ -1764,4 +1764,5 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
 
