@@ -166,13 +166,13 @@ ORDINALES_MAP = {
 ORDINAL_RE = re.compile(r'\b(' + '|'.join(ORDINALES_MAP.keys()) + r')\b', re.I)
 
 PAGO_RE = re.compile(
-    r'(pagar|pago|quiero pagar|voy a pagar|prefiero pagar|el pago|pagaremos|pagare).*(transferencia|bancolombia|davivienda|payu|pago en tienda|efectivo|contraentrega)'
-    r'|(transferencia|bancolombia|davivienda|payu|pago en tienda|efectivo|contraentrega).*(pagar|pago|quiero|voy|prefiero|pagaremos|pagare)',
+    r'(pagar|pago|quiero pagar|voy a pagar|prefiero pagar|el pago|pagaremos|pagare).*(transferencia|bancolombia|davivienda|pse|payu|pago en tienda|efectivo|contraentrega)'
+    r'|(transferencia|bancolombia|davivienda|pse|payu|pago en tienda|efectivo|contraentrega).*(pagar|pago|quiero|voy|prefiero|pagaremos|pagare)',
     re.I
 )
 CONFIRM_RE = re.compile(
-    r'(confirmar|confirmo|finalizar|cerrar|terminar|listo|realizar).*(pedido|compra|orden)'
-    r'|(pedido|compra|orden).*(confirmar|confirmo|finalizar|cerrar|terminar|listo|realizar)',
+    r'(confirmar|confirmo|finalizar|cerrar|terminar|listo|realizar|as[ií]\s*est[aá]\s*bien|est[aá]\s*bien)'
+    r'.*(pedido|compra|orden)?|^(s[ií]|ok|dale|listo)\b',
     re.I
 )
 
@@ -187,6 +187,13 @@ app.add_middleware(
 )
 app.include_router(agent_router)
 
+def _fmt_cop(v: float) -> str:
+    """Formatea a COP con punto como separador de miles."""
+    try:
+        return f"${int(float(v)):,}".replace(",", ".")
+    except Exception:
+        return "$0"
+
 async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
     # 👉 Pago / Confirmación (router híbrido: regex -> LLM clasificador)
     pago_match = PAGO_RE.search(text)
@@ -200,9 +207,9 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
         t = t.lower()
         if any(k in t for k in ["transferencia", "bancolombia", "davivienda"]):
             return "transferencia"
-        if "payu" in t:
+        if "payu" in t or "pse" in t:
             return "payu"
-        if any(k in t for k in ["pago en tienda", "efectivo", "contraentrega"]):
+        if any(k in t for k in ["pago en tienda", "efectivo", "contraentrega", "en tienda"]):
             return "pago_en_tienda"
         return None
 
@@ -227,6 +234,10 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
                 )
             }
         else:
+            # pago_en_tienda -> quedamos esperando confirmación corta
+            ctx = _ctx_load(pedido)
+            ctx["awaiting_confirmation"] = True
+            _ctx_save(db, session_id, ctx)
             return {
                 "response": (
                     "Listo. Pagas directamente en la tienda al recoger tu pedido. "
@@ -285,7 +296,7 @@ async def detectar_intencion_pago_confirmacion(texto: str) -> dict:
             '  "method": "transferencia" | "payu" | "pago_en_tienda" | null,\n'
             '  "confidence": number\n'
             "}\n\n"
-            "Mapeo: transferencia/bancolombia/davivienda -> transferencia; payu -> payu; "
+            "Mapeo: transferencia/bancolombia/davivienda -> transferencia; payu/pse -> payu; "
             "efectivo/pago en tienda/contraentrega -> pago_en_tienda"
         )
         completion = client.chat.completions.create(
@@ -408,8 +419,6 @@ def _get_last_msg_id(db: Session, session_id: str) -> Optional[str]:
         return row[0] if row and row[0] else None
     except Exception:
         return None
-
-import json as _json
 
 def set_user_filter(db: Session, session_id: str, filtro: dict):
     try:
@@ -656,12 +665,12 @@ def _cart_summary_lines(carrito: list) -> List[str]:
         return ["Tu carrito está vacío."]
     lines = []
     for i, it in enumerate(carrito, 1):
-        precio = f"${int(it.get('precio_unitario', 0)):,.0f}"
+        precio = _fmt_cop(it.get('precio_unitario', 0))
         qty = int(it.get("cantidad", 1))
         tail = " ".join([x for x in [(it.get("color") or ""), (it.get("talla") or "")] if x]).strip()
         tail = f" {tail}" if tail else ""
         lines.append(f"{i}. {it['nombre']} ({it['sku']}){tail} x{qty} – {precio} c/u")
-    lines.append(f"\nTotal: ${int(_cart_total(carrito)):,.0f}")
+    lines.append(f"\nTotal: {_fmt_cop(_cart_total(carrito))}")
     return lines
 
 #  Prompt maestro
@@ -848,8 +857,8 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
             for a in acts or []:
                 if isinstance(a, dict) and "tipo" in a and "args" in a:
                     if a.get("tipo") == "cache_list":
-                        prods = (a.get("args") or {}).get("productos") or []
-                        for p in prods:
+                        prods2 = (a.get("args") or {}).get("productos") or []
+                        for p in prods2:
                             if isinstance(p, dict) and "tallas_disponibles" in p:
                                 p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                 norm_acts.append(a)
@@ -873,7 +882,7 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
 def _formatear_sugerencias(lista: List[dict]) -> str:
     lines = []
     for i, p in enumerate(lista[:3], start=1):
-        precio = f"${p['precio']:,}"
+        precio = _fmt_cop(p.get('precio', 0))
         lines.append(f"{i}. {p['nombre']} - {precio} - {p['url']}")
     return "Aquí tienes algunas opciones:\n" + "\n".join(lines)
 
@@ -923,11 +932,13 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
         return None
 
     action = payload.get("action")
+
     if action == "SHOW_CART":
         carrito = _carrito_load(pedido)
         return {"response": "\n".join(_cart_summary_lines(carrito))}
 
     if action == "ASK_VARIANT":
+        # ✅ CORREGIDO: bloque completo y autónomo (sin variables externas)
         ref = payload.get("product_ref")
         prod = _resolve_product_ref(db, session_id, ref) if ref else None
         if prod:
@@ -952,7 +963,7 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
 
     if action == "REMOVE_FROM_CART":
         carrito = _carrito_load(pedido)
-        sku = str(payload.get("product_id") or "")
+        sku = str(payload.get("product_id") or payload.get("sku") or "")
         talla = payload.get("size")
         color = payload.get("color")
         carrito = _cart_remove(carrito, sku, talla, color)
@@ -1025,10 +1036,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             "saludo_enviado": 0,
             "last_msg_id": None,
             "sugeridos": "",
-            "ctx_json": "{}",
-            "ultima_categoria": "",
-            "ultimos_filtros": "",
-            "sugeridos_json": "",
+            "ctx_json": "{}",            # ✅ asegurado
+            "ultima_categoria": "",      # ✅ asegurado
+            "ultimos_filtros": "",       # ✅ asegurado
+            "sugeridos_json": "",        # ✅ asegurado
             "carrito_json": "[]",
             "preferencias_json": "{}",
         })
@@ -1064,7 +1075,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         print("[DBG] Guardando filtros:", filtros_detectados)
         set_user_filter(db, session_id, filtros_detectados)
 
-    # ✅ Si llegó talla y hay un producto pendiente (ASK_VARIANT), agréguelo al carrito
+    # ✅ Si llegó talla y hay un producto pendiente (ASK_VARIANT), agréguelo al carrito y limpia pending
     if "talla" in filtros_detectados:
         ctx = _ctx_load(pedido)
         pv = ctx.get("pending_variant")
@@ -1092,7 +1103,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 _ctx_save(db, session_id, ctx)
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
-    # ✅ Fast-path: “talla L” (o 38) para la última selección
+    # ✅ Fast-path: “talla L” (o 38) para la última selección SIN pedir lista de nuevo
     m_talla_solo = TALLA_TOKEN_RE.search(user_text)
     if m_talla_solo and not MOSTRAR_RE.search(user_text) and not SELECCION_RE.search(user_text) and not ORDINAL_RE.search(user_text):
         talla_elegida = (m_talla_solo.group(1) or "").upper()
@@ -1123,7 +1134,43 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                     pass
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
-    # Manejo prioritario de pago / confirmación
+    # ✅ Confirmación corta basada en contexto (sí/ok/dale/así está bien)
+    ctx_tmp = _ctx_load(pedido)
+    if ctx_tmp.get("awaiting_confirmation"):
+        if re.search(r'^(s[ií]|ok|dale|listo|de acuerdo|est(a|á)\s*bien|as(i|í)\s*est(a|á)\s*bien)\b', user_text, re.I):
+            actualizar_pedido_por_sesion(db, session_id, "estado", "confirmado")
+            try:
+                ctx_tmp.pop("awaiting_confirmation", None)
+                _ctx_save(db, session_id, ctx_tmp)
+            except Exception:
+                pass
+            pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
+            try:
+                enviar_pedido_a_hubspot(pedido_actualizado)
+            except Exception:
+                pass
+            try:
+                mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
+                await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
+            except Exception:
+                pass
+
+            carrito = _carrito_load(pedido_actualizado)
+            resumen = "\n".join(_cart_summary_lines(carrito))
+            metodo_entrega = (pedido_actualizado.metodo_entrega or "").replace("_", " ")
+            metodo_pago = (pedido_actualizado.metodo_pago or "").replace("_", " ")
+
+            return {
+                "response": (
+                    f"¡Pedido confirmado!\n\nResumen:\n{resumen}\n\n"
+                    f"Entrega: {metodo_entrega or 'pendiente'}\n"
+                    f"Pago: {metodo_pago or 'pendiente'}\n\n"
+                    "Te contactaremos en breve para coordinar el siguiente paso. "
+                    "¿Quieres agregar algo más?"
+                )
+            }
+
+    # ✅ Manejo de pago/confirmación (router híbrido): antes de cualquier otra cosa
     resp_pago = await procesar_mensaje_usuario(user_text, db, session_id, pedido)
     if resp_pago:
         return resp_pago
@@ -1150,6 +1197,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             "saludo_enviado": 0,
             "last_msg_id": None,
             "sugeridos": "",
+            "ctx_json": "{}",            # ✅ agregado en reinicio
+            "ultima_categoria": "",      # ✅ agregado en reinicio
+            "ultimos_filtros": "",       # ✅ agregado en reinicio
+            "sugeridos_json": "",        # ✅ agregado en reinicio
             "carrito_json": "[]",
             "preferencias_json": "{}",
         })
@@ -1162,7 +1213,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         actualizar_pedido_por_sesion(db, session_id, "telefono", telefono_cliente)
 
     if pedido and pedido.estado == "cancelado":
-        if re.match(r'^(hola|buen(?:o|a)s? días?|buenas tardes|buenas noches|hey)\b', user_text):
+        if SALUDO_RE.match(user_text):  # ✅ unificado con SALUDO_RE
             db.query(Pedido).filter(Pedido.session_id == session_id).delete()
             db.commit()
             crear_pedido(db, {
@@ -1184,6 +1235,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 "saludo_enviado": 0,
                 "last_msg_id": None,
                 "sugeridos": "",
+                "ctx_json": "{}",            # ✅
+                "ultima_categoria": "",      # ✅
+                "ultimos_filtros": "",       # ✅
+                "sugeridos_json": "",        # ✅
                 "carrito_json": "[]",
                 "preferencias_json": "{}",
             })
@@ -1217,7 +1272,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             )
         }
 
-    if any(neg in user_text for neg in ["ya no quiero", "cancelar pedido", "no deseo", "me arrepentí"]):
+    if any(neg in user_text for neg in ["ya no quiero", "cancelar pedido", "no deseo", "me arrepentí", "me arrepenti"]):
         producto_cancelado = pedido.producto or "el pedido actual"
         actualizar_pedido_por_sesion(db, session_id, "estado", "cancelado")
         actualizar_pedido_por_sesion(db, session_id, "producto", "")
@@ -1736,9 +1791,15 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
     if campos_dict.get("estado") == "confirmado":
         pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
-        enviar_pedido_a_hubspot(pedido_actualizado)
-        mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
-        await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
+        try:
+            enviar_pedido_a_hubspot(pedido_actualizado)
+        except Exception:
+            pass
+        try:
+            mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
+            await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
+        except Exception:
+            pass
 
     return {"response": resultado.get("respuesta", "Disculpa, ocurrió un error.")}
 
@@ -1769,11 +1830,17 @@ async def receive_whatsapp_message(request: Request):
                 continue
 
             for msg in value.get("messages", []):
-                if msg.get("type") != "text":
+                # Soporte básico: texto e interactivos (botón/lista)
+                msg_type = msg.get("type")
+                if msg_type not in ("text", "interactive"):
                     continue
 
                 num = msg.get("from")
-                txt = (msg.get("text") or {}).get("body", "")
+                if msg_type == "interactive":
+                    inter = msg.get("interactive") or {}
+                    txt = (inter.get("button_reply") or {}).get("title") or (inter.get("list_reply") or {}).get("title") or ""
+                else:
+                    txt = (msg.get("text") or {}).get("body", "")
                 msg_id = msg.get("id")
 
                 if not (num and txt and msg_id):
@@ -1816,3 +1883,4 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
