@@ -671,13 +671,15 @@ with open("prompt_cassany_gpt_final.txt", "r", encoding="utf-8") as fh:
 ACTIONS_PROTOCOL = """
 === PROTOCOLO DE ACCIONES (OBLIGATORIO) ===
 Cuando el usuario pida operar el carrito (agregar, quitar, ver, cambiar talla), RESPONDE SOLO con JSON válido (sin texto extra) usando exactamente uno de:
-{"action":"ADD_TO_CART","product_ref":"<n|id|url>","size":null}
+{"action":"ADD_TO_CART","product_ref":"<n|id|url>","size":null,"qty":1}
 {"action":"REMOVE_FROM_CART","product_id":123}
 {"action":"SHOW_CART"}
-{"action":"ASK_VARIANT","missing":"size"}
+{"action":"ASK_VARIANT","product_ref":"<n|id|url>","missing":"size","qty":1}
 {"action":"CLARIFY","question":"¿Cuál talla prefieres?"}
+
+Reglas:
 - "product_ref": acepta el índice mostrado al usuario (1,2,3), el id del producto o su URL.
-- Si el producto requiere talla y el usuario no la dio, usa ASK_VARIANT.
+- Si el producto requiere talla y el usuario no la dio, usa ASK_VARIANT **incluyendo siempre product_ref** y opcionalmente "qty".
 - Si el usuario dice “agrega el 1”, usa {"action":"ADD_TO_CART","product_ref":"1"}.
 - NUNCA mezcles texto humano con el JSON; la respuesta debe ser solo el JSON.
 """.strip()
@@ -926,10 +928,56 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
         return {"response": "\n".join(_cart_summary_lines(carrito))}
 
     if action == "ASK_VARIANT":
-        return {"response": payload.get("question") or "¿Cuál talla prefieres?"}
+    ref = payload.get("product_ref")
+    prod = _resolve_product_ref(db, session_id, ref) if ref else None
+    if prod:
+        # Guarda el pendiente en el contexto
+        ctx = _ctx_load(pedido)
+        ctx["pending_variant"] = {
+            "ref": ref,
+            "sku": prod.get("sku") or prod.get("url") or prod.get("nombre"),
+            "qty": int(payload.get("qty") or 1),
+        }
+        _ctx_save(db, session_id, ctx)
+
+        tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
+        if tallas:
+            return {"response": f"Para «{prod.get('nombre','Producto')}», ¿qué talla prefieres? Opciones: {', '.join(tallas)}"}
+        return {"response": "¿Qué talla prefieres?"}
+    # Si no sabemos el producto, pedimos aclaración
+    return {"response": "¿De cuál producto necesitas la talla? Indícame el número (1, 2 o 3) o envíame el enlace."}
+
 
     if action == "CLARIFY":
         return {"response": payload.get("question") or "¿Podrías confirmar qué producto?"}
+
+    if "talla" in filtros_detectados:
+    ctx = _ctx_load(pedido)
+    pv = ctx.get("pending_variant")
+    if pv:
+        prod = _resolve_product_ref(db, session_id, pv.get("ref") or pv.get("sku"))
+        if prod:
+            carrito = _carrito_load(pedido)
+            carrito = _cart_add(
+                carrito,
+                sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
+                nombre=prod.get("nombre","Producto"),
+                categoria=prod.get("categoria",""),
+                talla=filtros_detectados["talla"],
+                color=prod.get("color"),
+                cantidad=int(pv.get("qty") or 1),
+                precio_unitario=float(prod.get("precio", 0.0)),
+            )
+            _carrito_save(db, session_id, carrito)
+            try:
+                actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
+            except Exception:
+                pass
+            # Limpia el pendiente
+            ctx.pop("pending_variant", None)
+            _ctx_save(db, session_id, ctx)
+
+            return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
     if action == "REMOVE_FROM_CART":
         carrito = _carrito_load(pedido)
@@ -1764,5 +1812,6 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
 
 
