@@ -1,4 +1,4 @@
-APP_BUILD = "build_06"
+APP_BUILD = "build_07"
 
 import os
 import json
@@ -123,7 +123,10 @@ MAS_OPCIONES_RE = re.compile(r'\b(más opciones|mas opciones|muéstrame más|mue
 DOMICILIO_RE = re.compile(r'\b(a\s*domicilio|env[ií]o\s*a\s*domicilio|domicilio)\b', re.I)
 RECOGER_RE  = re.compile(r'\b(recoger(?:lo)?\s+en\s+(tienda|sucursal)|retiro\s+en\s+tienda)\b', re.I)
 SELECCION_RE = re.compile(r'(?:opci(?:o|ó)n\s*(\d+))|(?:\bla\s*(\d+)\b)|(?:n[uú]mero\s*(\d+))|^(?:\s*)(\d+)(?:\s*)$', re.I)
+
+# Verbos de “agregar”
 ADD_RE = re.compile(r'\b(agrega|agregar|añade|añadir|mete|pon(?:er)?|suma|agregalo|agregá|agregame)\b', re.I)
+
 OFFTOPIC_RE = re.compile(
     r"(qué\s+vend[eé]n?|que\s+vend[eé]n?|qué\s+es\s+cassany|qu[eé]\s+es\s+cassany|"
     r"d[oó]nde\s+est[aá]n|ubicaci[oó]n|horarios?|qu[ií]en(es)?\s+son|historia|"
@@ -139,13 +142,29 @@ DISCOVERY_RE = re.compile(
 CARRO_RE   = re.compile(r'\b(carrito|mi carrito|ver carrito|ver el carrito|carro|mi pedido|resumen del pedido)\b', re.I)
 MOSTRAR_RE = re.compile(r'\b(mu[eé]strame|muestrame|mostrarme|puedes mostrarme|puede mostrarme|podr[ií]as? mostrarme|quiero ver|ens[eñ]a(?:me)?)\b', re.I)
 FOTOS_RE   = re.compile(r'\b(fotos?|im[aá]genes?)\s+de\s+([a-záéíóúñü\s]+)\b', re.I)
-TALLA_RE = re.compile(r'\btalla\b|\b(XXL|XL|XS|S|M|L)\b', re.I)
+
+# Tallas
+TALLA_RE = re.compile(r'\btalla\b|\b(XXL|XL|XS|S|M|L)\b', re.I)  # para detectar la palabra
+TALLA_TOKEN_RE = re.compile(r'\b(XXL|XL|XS|S|M|L|28|30|32|34|36|38|40|42)\b', re.I)  # para extraer valor real
 USO_RE = re.compile(r'\b(oficina|formal|casual|evento|trabajo)\b', re.I)
 MANGA_RE = re.compile(r'\bmanga\s+(corta|larga)\b', re.I)
 COLOR_RE = re.compile(
     r'\b(blanco|blanca|negro|negra|azul|azules|beige|gris|rojo|verde|café|marr[oó]n|vinotinto|mostaza|'
     r'crema|turquesa|celeste|lila|morado|rosa|rosado|amarillo|naranja)\b', re.I
 )
+
+# Ordinales (la primera/segunda/...)
+ORDINALES_MAP = {
+    "primer": 1, "primera": 1, "primero": 1, "uno": 1, "una": 1,
+    "segundo": 2, "segunda": 2, "dos": 2,
+    "tercero": 3, "tercera": 3, "tres": 3,
+    "cuarto": 4, "cuarta": 4, "cuatro": 4,
+    "quinto": 5, "quinta": 5, "cinco": 5,
+    "sexto": 6, "sexta": 6, "seis": 6,
+    "séptimo": 7, "septimo": 7, "séptima": 7, "septima": 7, "siete": 7,
+}
+ORDINAL_RE = re.compile(r'\b(' + '|'.join(ORDINALES_MAP.keys()) + r')\b', re.I)
+
 PAGO_RE = re.compile(
     r'(pagar|pago|quiero pagar|voy a pagar|prefiero pagar|el pago|pagaremos|pagare).*(transferencia|bancolombia|davivienda|payu|pago en tienda|efectivo|contraentrega)'
     r'|(transferencia|bancolombia|davivienda|payu|pago en tienda|efectivo|contraentrega).*(pagar|pago|quiero|voy|prefiero|pagaremos|pagare)',
@@ -756,7 +775,7 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
     elif mensaje:
         extras["mensaje_sugerencias"] = mensaje
 
-    if estado["metodo_entrega"] == "recoger_en_tienda" and not estado["punto_venta"]:
+    if estado["metodo_entrega"] == "recoger_en_tienda" y not estado["punto_venta"]:
         extras["puntos_venta"] = PUNTOS_VENTA
 
     instruct_json = (
@@ -819,6 +838,22 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
         raw = completion.choices[0].message.content.strip()
         print("[DBG] respuesta LLM (raw):", raw)
         data = json.loads(raw)
+
+        # 🔧 Normaliza tallas ANTES del log para que salga limpio
+        if isinstance(data, dict):
+            acts = data.get("acciones") or []
+            norm_acts = []
+            for a in acts or []:
+                if isinstance(a, dict) and "tipo" in a and "args" in a:
+                    if a.get("tipo") == "cache_list":
+                        prods = (a.get("args") or {}).get("productos") or []
+                        for p in prods:
+                            if isinstance(p, dict) and "tallas_disponibles" in p:
+                                p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
+                norm_acts.append(a)
+            if norm_acts:
+                data["acciones"] = norm_acts
+
         print("[DBG] json parsed:", data)
         return data
     except Exception as e:
@@ -986,16 +1021,22 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     user_text = user_input.message.strip().lower()
     actualizar_pedido_por_sesion(db, session_id, "last_activity", ahora)
 
+    # --------- Detectar filtros del mensaje (con validación de talla) ---------
     filtros_detectados = {}
     m_color = COLOR_RE.search(user_text)
     if m_color:
         filtros_detectados["color"] = m_color.group(1).lower()
-    m_talla = TALLA_RE.search(user_text)
-    if m_talla:
-        filtros_detectados["talla"] = m_talla.group(1).upper() if m_talla.lastindex else m_talla.group(0).upper()
+
+    m_talla_tok = TALLA_TOKEN_RE.search(user_text)
+    if m_talla_tok:
+        talla_val = (m_talla_tok.group(1) or "").upper()
+        if talla_val in TALLAS_VALIDAS:        # ✅ solo tallas reales
+            filtros_detectados["talla"] = talla_val
+
     m_manga = MANGA_RE.search(user_text)
     if m_manga:
         filtros_detectados["manga"] = m_manga.group(1).lower()
+
     m_uso = USO_RE.search(user_text)
     if m_uso:
         filtros_detectados["uso"] = m_uso.group(1).lower()
@@ -1003,6 +1044,37 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     if filtros_detectados:
         print("[DBG] Guardando filtros:", filtros_detectados)
         set_user_filter(db, session_id, filtros_detectados)
+
+    # ✅ Fast-path: “talla L” (o 38) para la última selección
+    m_talla_solo = TALLA_TOKEN_RE.search(user_text)
+    if m_talla_solo and not MOSTRAR_RE.search(user_text) and not SELECCION_RE.search(user_text) and not ORDINAL_RE.search(user_text):
+        talla_elegida = (m_talla_solo.group(1) or "").upper()
+        if talla_elegida in TALLAS_VALIDAS:
+            ctx = _ctx_load(pedido)
+            last = (ctx.get("selecciones") or [])[-1] if ctx.get("selecciones") else None
+            if last:
+                lista = _get_sugeridos_list(db, session_id)
+                prod = next((p for p in (lista or []) if p.get("url") == last.get("url") or p.get("nombre") == last.get("nombre")), None) or last
+                tallas = _clean_tallas(prod.get("tallas_disponibles"))
+                if tallas and talla_elegida not in tallas:
+                    return {"response": f"Para «{prod.get('nombre','Producto')}» tengo {', '.join(tallas)}. ¿Quieres elegir una de esas tallas?"}
+                carrito = _carrito_load(pedido)
+                carrito = _cart_add(
+                    carrito,
+                    sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
+                    nombre=prod.get("nombre","Producto"),
+                    categoria=prod.get("categoria",""),
+                    talla=talla_elegida,
+                    color=prod.get("color"),
+                    cantidad=1,
+                    precio_unitario=float(prod.get("precio", 0.0))
+                )
+                _carrito_save(db, session_id, carrito)
+                try:
+                    actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
+                except Exception:
+                    pass
+                return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
     if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
         db.query(Pedido).filter(Pedido.session_id == session_id).delete()
@@ -1037,7 +1109,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         telefono_cliente = session_id.replace("cliente_", "")
         actualizar_pedido_por_sesion(db, session_id, "telefono", telefono_cliente)
 
-    if pedido and pedido.estado == "cancelado":
+    if pedido y pedido.estado == "cancelado":
         if re.match(r'^(hola|buen(?:o|a)s? días?|buenas tardes|buenas noches|hey)\b', user_text):
             db.query(Pedido).filter(Pedido.session_id == session_id).delete()
             db.commit()
@@ -1267,6 +1339,46 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
         return {"response": f"No detecté ninguna categoría concreta en tu solicitud. ¿Te gustaría que te muestre opciones de:\n{cats}"}
 
+    # ✅ Selección por ordinal (“la primera / segunda / tercera”)
+    m_ord = ORDINAL_RE.search(user_text)
+    if m_ord:
+        idx0 = ORDINALES_MAP[m_ord.group(1).lower()] - 1
+        lista = _get_sugeridos_list(db, session_id)
+        if lista and 0 <= idx0 < len(lista):
+            prod = lista[idx0]
+            actualizar_pedido_por_sesion(db, session_id, "producto", prod.get("nombre", ""))
+            actualizar_pedido_por_sesion(db, session_id, "precio_unitario", prod.get("precio", 0.0))
+            if not getattr(pedido, "cantidad", 0):
+                actualizar_pedido_por_sesion(db, session_id, "cantidad", 0)
+            try:
+                _remember_selection(db, session_id, prod, idx0 + 1)
+            except Exception:
+                pass
+            tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
+            if ADD_RE.search(user_text):
+                if tallas:
+                    return {"response": f"Perfecto. Para agregar «{prod.get('nombre','Producto')}» dime la talla ({', '.join(tallas)})."}
+                carrito = _carrito_load(pedido)
+                carrito = _cart_add(
+                    carrito,
+                    sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
+                    nombre=prod.get("nombre","Producto"),
+                    categoria=prod.get("categoria",""),
+                    talla=None,
+                    color=prod.get("color"),
+                    cantidad=1,
+                    precio_unitario=float(prod.get("precio", 0.0))
+                )
+                _carrito_save(db, session_id, carrito)
+                actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
+                return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
+            if tallas:
+                return {"response": f"Listo, seleccionaste la opción {idx0+1}. Tallas disponibles: {', '.join(tallas)}. ¿Cuál prefieres?"}
+            return {"response": f"Listo, seleccionaste la opción {idx0+1}. ¿Cuántas unidades deseas?"}
+        elif lista:
+            return {"response": f"Por favor indícame un número entre 1 y {len(lista)} de la lista que te mostré."}
+
+    # Selección por número (“opción 2”, “la 3”, “2”)
     m_sel = SELECCION_RE.search(user_text)
     if m_sel:
         num_txt = next((g for g in m_sel.groups() if g), None)
@@ -1401,7 +1513,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             consulta = " ".join(partes).strip()
             urls_previas = _get_sugeridos_urls(db, session_id)
-            res_fallback = sugerir_productos(consulta or user_text, limite=12, excluir_urls=urls_previas)
+            res_fallback = sugerir_productos(consulta o user_text, limite=12, excluir_urls=urls_previas)
             productos = res_fallback.get("productos", [])
 
             if productos:
