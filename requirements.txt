@@ -11,7 +11,7 @@ python-dotenv==1.0.1
 openai==1.51.0
 SQLAlchemy==2.0.32
 pydantic==2.8.2
-requests==2.32.3:
+requests==2.32.3
 psycopg[binary]==3.2.1  # (PostgreSQL)
 mysqlclient==2.2.4      # (MySQL/MariaDB)
 google-cloud-sql-connector[pg8000]==1.9.1
