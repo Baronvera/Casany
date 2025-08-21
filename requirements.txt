@@ -14,4 +14,5 @@ pydantic==2.8.2
 requests==2.32.3
 starlette>=0.37.2,<0.38.0
 typing-extensions>=4.8.0
+fastapi-cli==0.0.5
 #requisitos#
