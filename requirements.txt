@@ -5,8 +5,6 @@ python-multipart>=0.0.9,<0.0.10
 python-ulid>=1.1
 aiofiles>=23.2
 gunicorn>=21.2,<22
-
-
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 python-dotenv==1.0.1
@@ -16,3 +14,5 @@ pydantic==2.8.2
 requests==2.32.3:
 psycopg[binary]==3.2.1  # (PostgreSQL)
 mysqlclient==2.2.4      # (MySQL/MariaDB)
+google-cloud-sql-connector[pg8000]==1.9.1
+pg8000==1.31.2
