@@ -33,18 +33,19 @@ load_dotenv(override=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")  # opcional
-if not OPENAI_API_KEY:
-    raise RuntimeError("Falta OPENAI_API_KEY en el entorno (.env).")
 
-openai_client_kwargs = {
-    "api_key": OPENAI_API_KEY,
-    "timeout": 30,
-    "max_retries": 2,
-}
-if OPENAI_PROJECT_ID:
-    openai_client_kwargs["project"] = OPENAI_PROJECT_ID
-
-client = OpenAI(**openai_client_kwargs)
+client = None
+if OPENAI_API_KEY:
+    openai_client_kwargs = {
+        "api_key": OPENAI_API_KEY,
+        "timeout": 30,
+        "max_retries": 2,
+    }
+    if OPENAI_PROJECT_ID:
+        openai_client_kwargs["project"] = OPENAI_PROJECT_ID
+    client = OpenAI(**openai_client_kwargs)
+else:
+    print("⚠️  OPENAI_API_KEY no definido. Arranca sin LLM; endpoints seguirán respondiendo.")
 
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN")
 WHATSAPP_PHONE_NUMBER = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
@@ -674,8 +675,12 @@ def _cart_summary_lines(carrito: list) -> List[str]:
     return lines
 
 #  Prompt maestro
-with open("prompt_cassany_gpt_final.txt", "r", encoding="utf-8") as fh:
-    base_prompt = fh.read().strip()
+try:
+    with open("prompt_cassany_gpt_final.txt", "r", encoding="utf-8") as fh:
+        base_prompt = fh.read().strip()
+except Exception as e:
+    print("⚠️  No encontré prompt_cassany_gpt_final.txt, usando prompt mínimo:", e)
+    base_prompt = "Eres un asistente de ventas de CASSANY. Responde breve y profesional."
 
 ACTIONS_PROTOCOL = """
 === PROTOCOLO DE ACCIONES (OBLIGATORIO) ===
@@ -1883,6 +1888,7 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
 
 
 
