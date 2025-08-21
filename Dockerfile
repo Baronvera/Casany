@@ -24,7 +24,7 @@ RUN useradd -m appuser
 # Instala deps desde las ruedas generadas (sin tocar internet)
 COPY --from=builder /wheels /wheels
 COPY requirements.txt .
-RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt
+RUN pip install --no-cache-dir --find-links=/wheels -r requirements.txt
 
 # Copia todo tu proyecto (controla con .dockerignore)
 COPY . .
