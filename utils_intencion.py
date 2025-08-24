@@ -1,4 +1,4 @@
-# utils_intencion.py — v2.0
+# utils_intencion.py — v2.1 (mejorado)
 import re
 import unicodedata
 from typing import List
@@ -9,35 +9,34 @@ def _norm(s: str) -> str:
     s = unicodedata.normalize("NFD", s)
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
-# Palabras/frases que fuertemente indican querer hablar con alguien
-# (usamos regex con límites de palabra para evitar falsos positivos)
+# Patrones POSITIVOS: expresiones que indican intención clara de hablar con un humano/asesor
 PATRONES_POSITIVOS: List[re.Pattern] = [
     # hablar/escribir/comunicar con alguien/persona/asesor/humano
-    re.compile(r"\b(hablar|escribir|chatear|comunicar(?:me)?)\s+con\s+(alguien|una\s+persona|un\s+asesor|asesor|humano)\b"),
+    re.compile(r"\b(hablar|escribir|chatear|comunicar(?:me)?)\s+con\s+(alguien|persona|asesor|humano)\b"),
     # poner/pasar/conectar con asesor/humano/persona
-    re.compile(r"\b(pon(?:me|er)|p[aá]same|con[eé]ct(?:a|ame)|conectar(?:me)?)\s+con\s+(un|una|el|la)?\s*(asesor|humano|persona)\b"),
-    # quiero/puedo hablar con asesor/persona/humano
-    re.compile(r"\b(quiero|puedo|necesito)\s+(hablar|comunicarme)\s+con\s+(un|una|el|la)?\s*(asesor|persona|humano)\b"),
-    # atencion/trato humana/personalizada
-    re.compile(r"\b(atenci[oó]n|trato)\s+(humana|personalizada|directa)\b"),
+    re.compile(r"\b(pon(?:me|er)|pasame|conect(?:a|ame)|conectar(?:me)?)\s+con\s+(asesor|humano|persona)\b"),
+    # quiero/puedo/necesito hablar con asesor/persona/humano
+    re.compile(r"\b(quiero|puedo|necesito|prefiero)\s+(hablar|comunicarme|atencion)\s+con\s+(asesor|persona|humano)\b"),
+    # atencion/trato humano/personalizado
+    re.compile(r"\b(atencion|trato)\s+(humana|personalizada|directa|real)\b"),
+    # expresiones de urgencia
+    re.compile(r"\b(quiero|necesito).*(asesor|humano|persona real)\b"),
     # siempre hablo con / me atiende <nombre>
     re.compile(r"\b(siempre\s+hablo\s+con|me\s+atiende)\s+\w+\b"),
-    # envíame/mándame fotos
-    re.compile(r"\b(env[ií]ame|m[aá]ndame)\s+fotos\b"),
-    # muéstrame/quiero ver lo que queda / las fotos
-    re.compile(r"\b(mu[eé]strame|quiero\s+ver)\s+(lo\s+que\s+queda|las\s+fotos|el\s+cat[aá]logo\s+real)\b"),
-    # frases sueltas frecuentes
-    re.compile(r"\b(asesor|humano)\b"),
+    # envíame/mándame fotos reales
+    re.compile(r"\b(env(iame|íame)|mandame)\s+(fotos|imagenes|catalogo real)\b"),
+    # muéstrame/quiero ver fotos reales
+    re.compile(r"\b(muestrame|quiero\s+ver)\s+(fotos|imagenes|catalogo\s+real)\b"),
 ]
 
-# Filtros negativos: si hay negación cerca de las palabras clave, NO activar
+# Patrones NEGATIVOS: evitan falsos positivos si hay negación clara
 PATRONES_NEGATIVOS: List[re.Pattern] = [
     # no + (hablar|asesor|persona|humano|atencion)
-    re.compile(r"\bno\b.*\b(hablar|asesor|persona|humano|atenci[oó]n)\b"),
+    re.compile(r"\bno\b.*\b(hablar|asesor|persona|humano|atencion)\b"),
     # prefiero seguir aqui / con el bot / por chat
-    re.compile(r"\b(prefiero|quiero)\s+(seguir|continuar)\s+(aqu[ií]|por\s+chat|con\s+el\s+bot)\b"),
+    re.compile(r"\b(prefiero|quiero)\s+(seguir|continuar)\s+(aqui|por\s+chat|con\s+el\s+bot)\b"),
     # no necesito / no requiero asesor / atencion
-    re.compile(r"\b(no\s+(necesito|requiero))\s+(asesor|atenci[oó]n|persona|humano)\b"),
+    re.compile(r"\b(no\s+(necesito|requiero))\s+(asesor|atencion|persona|humano)\b"),
 ]
 
 def detectar_intencion_atencion(texto: str) -> bool:
@@ -47,16 +46,14 @@ def detectar_intencion_atencion(texto: str) -> bool:
     """
     t = _norm(texto)
 
-    # Si se detecta negación clara, no activar
+    # Primero revisamos patrones negativos (niegan explícitamente la intención)
     for pat in PATRONES_NEGATIVOS:
         if pat.search(t):
             return False
 
-    # Positivos: basta con que uno encaje
+    # Luego patrones positivos (basta con que uno encaje)
     for pat in PATRONES_POSITIVOS:
         if pat.search(t):
             return True
 
     return False
-
-
