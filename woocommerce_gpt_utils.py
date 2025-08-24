@@ -1,4 +1,4 @@
-"""woocommerce_gpt_utils.py  –  v2.3
+"""woocommerce_gpt_utils.py  –  v2.4
 Funciones auxiliares para:
 • Detectar la intención de compra en lenguaje natural
 • Consultar WooCommerce y devolver productos realmente disponibles
@@ -96,11 +96,25 @@ def _woo_get(endpoint: str, params: Dict[str, Union[str, int]]) -> list:
     resp.raise_for_status()
     return resp.json()
 
+def _parse_price(val) -> float:
+    """Convierte el precio a float de forma segura, evitando errores con '', None, etc."""
+    try:
+        if val is None:
+            return 0.0
+        if isinstance(val, (int, float)):
+            return float(val)
+        val = str(val).strip()
+        if val == "" or val.lower() in {"null", "none"}:
+            return 0.0
+        return float(val)
+    except Exception:
+        return 0.0
+
 def _filtrar_stock(items: list) -> list:
     return [
         p for p in items
         if str(p.get("stock_status", "instock")) == "instock"
-           and float(p.get("price", 0)) > 0
+           and _parse_price(p.get("price", 0)) > 0
     ]
 
 # ---------- NUEVO: detección de atributos en texto ----------
@@ -204,7 +218,7 @@ def get_variaciones(product_id: int) -> List[dict]:
         return [
             v for v in variaciones
             if v.get("stock_status") == "instock"
-               and float(v.get("price", 0)) > 0
+               and _parse_price(v.get("price", 0)) > 0
         ]
     except Exception:
         return []
@@ -294,7 +308,7 @@ def sugerir_productos(
                     tallas.append(opt)
         productos_detalle.append({
             "nombre": p.get("name", ""),
-            "precio": float(p.get("price", 0)),
+            "precio": _parse_price(p.get("price", 0)),
             "url": p.get("permalink", ""),
             "tallas_disponibles": tallas
         })
