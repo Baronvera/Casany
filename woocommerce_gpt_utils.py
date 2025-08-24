@@ -1,15 +1,14 @@
-"""woocommerce_gpt_utils.py  –  v2.2
+"""woocommerce_gpt_utils.py  –  v2.3
 Funciones auxiliares para:
 • Detectar la intención de compra en lenguaje natural
 • Consultar WooCommerce y devolver productos realmente disponibles
 • Mostrar tallas disponibles por producto (variaciones)
-• Filtrar por atributos declarados por el usuario (manga larga/corta, guayabera, color básico)
+• Filtrar por atributos declarados por el usuario (manga larga/corta, guayabera, color básico, lociones)
 """
 from __future__ import annotations
 import os
 import re
 import unicodedata
-from functools import lru_cache
 from typing import Dict, List, Tuple, Union, Optional
 
 import requests
@@ -41,28 +40,42 @@ CATEGORY_IDS: Dict[str, int] = {
 
 # Sinónimos y expresiones habituales → categoría canonical
 SYNONYMS: Dict[str, str] = {
+    # --- Camisas ---
     "camisa": "camisas",
     "guayabera": "camisas",
     "guayaberas": "camisas",
     "manga corta": "camisas",
     "manga larga": "camisas",
 
+    # --- Camisetas ---
     "tshirt": "camisetas",
     "t-shirt": "camisetas",
     "playera": "camisetas",
 
+    # --- Jeans y pantalones ---
     "jean": "jeans",
     "denim": "jeans",
     "pantalón": "pantalones",
     "pantalon": "pantalones",
 
+    # --- Suéteres ---
     "saco": "sueteres",
     "buzo": "sueteres",
 
+    # --- Bermudas ---
     "short": "bermudas",
 
+    # --- Calzado ---
     "zapatos": "calzado",
     "mocasines": "calzado",
+
+    # --- Lociones / perfumes (nuevo) ---
+    "locion": "accesorios",
+    "lociones": "accesorios",
+    "perfume": "accesorios",
+    "perfumes": "accesorios",
+    "fragancia": "accesorios",
+    "fragancias": "accesorios",
 }
 
 def _normalize(txt: str) -> str:
