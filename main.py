@@ -1,10 +1,12 @@
+# main.py
 APP_BUILD = "build_09"
 
 import os
 import json
 import re
 import unicodedata
-import requests
+import requests  # se mantiene por compatibilidad, aunque ya usamos httpx para WhatsApp
+import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, List
 
@@ -34,6 +36,7 @@ load_dotenv(override=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")  # opcional
+WA_GRAPH_API_VER = os.getenv("WA_GRAPH_API_VER", "v17.0")
 
 client = None
 if OPENAI_API_KEY:
@@ -177,7 +180,6 @@ CONFIRM_RE = re.compile(
     re.I
 )
 
-
 # --- Cantidades (para capturar "1", "una", "dos", etc.) ---
 QTY_WORDS_MAP = {
     "un": 1, "uno": 1, "una": 1,
@@ -316,6 +318,8 @@ def _tiene_atributos_especificos(txt: str) -> bool:
     ])
 
 async def detectar_intencion_pago_confirmacion(texto: str) -> dict:
+    if client is None:
+        return {"intent": "ninguno", "method": None, "confidence": 0.0}
     try:
         schema_msg = (
             "Clasifica la intención del usuario respecto al flujo de compra.\n"
@@ -785,6 +789,16 @@ def _clean_json(texto: str) -> dict:
         }
 
 async def procesar_conversacion_llm(pedido, texto_usuario: str):
+    if client is None:
+        # Fallback sin LLM
+        carrito = _carrito_load(pedido)
+        lineas = _cart_summary_lines(carrito)
+        return {
+            "campos": {},
+            "respuesta": "Puedo continuar con tu compra. ¿Te muestro camisas o jeans?\n\n" + "\n".join(lineas),
+            "acciones": []
+        }
+
     estado = {
         "producto": pedido.producto or None,
         "talla": pedido.talla or None,
@@ -883,7 +897,7 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
         print("[DBG] respuesta LLM (raw):", raw)
         data = json.loads(raw)
 
-        # 🔧 Normaliza tallas ANTES del log para que salga limpio
+        # 🔧 Normaliza tallas dentro de acciones cache_list
         if isinstance(data, dict):
             acts = data.get("acciones") or []
             norm_acts = []
@@ -971,7 +985,6 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
         return {"response": "\n".join(_cart_summary_lines(carrito))}
 
     if action == "ASK_VARIANT":
-        # ✅ CORREGIDO: bloque completo y autónomo (sin variables externas)
         ref = payload.get("product_ref")
         prod = _resolve_product_ref(db, session_id, ref) if ref else None
         if prod:
@@ -988,7 +1001,6 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
             if tallas:
                 return {"response": f"Para «{prod.get('nombre','Producto')}», ¿qué talla prefieres? Opciones: {', '.join(tallas)}"}
             return {"response": "¿Qué talla prefieres?"}
-        # Si no sabemos el producto, pedimos aclaración
         return {"response": "¿De cuál producto necesitas la talla? Indícame el número (1, 2 o 3) o envíame el enlace."}
 
     if action == "CLARIFY":
@@ -1020,6 +1032,9 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
         size = payload.get("size")
         if tallas and not size:
             return {"response": f"Para agregar «{prod.get('nombre','Producto')}» necesito la talla: {', '.join(tallas)}. ¿Cuál prefieres?"}
+        # valida que la talla exista
+        if tallas and size and size.upper() not in tallas:
+            return {"response": f"Para «{prod.get('nombre','Producto')}» tengo {', '.join(tallas)}. ¿Quieres elegir una de esas tallas?"}
 
         carrito = _carrito_load(pedido)
         carrito = _cart_add(
@@ -1027,7 +1042,7 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
             sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
             nombre=prod.get("nombre","Producto"),
             categoria=prod.get("categoria",""),
-            talla=size,
+            talla=size.upper() if isinstance(size, str) else size,
             color=payload.get("color") or prod.get("color"),
             cantidad=int(payload.get("qty") or 1),
             precio_unitario=float(prod.get("precio", 0.0)),
@@ -1115,6 +1130,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         if pv:
             prod = _resolve_product_ref(db, session_id, pv.get("ref") or pv.get("sku"))
             if prod:
+                # valida coherencia de talla si el producto la lista
+                tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
+                if tallas and filtros_detectados["talla"] not in tallas:
+                    return {"response": f"Para «{prod.get('nombre','Producto')}» tengo {', '.join(tallas)}. ¿Quieres elegir una de esas tallas?"}
                 carrito = _carrito_load(pedido)
                 carrito = _cart_add(
                     carrito,
@@ -1239,59 +1258,60 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     if resp_pago:
         return resp_pago
 
-   if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
-    # Reinicia la sesión/pedido
-    db.query(Pedido).filter(Pedido.session_id == session_id).delete()
-    db.commit()
-    crear_pedido(
-        db,
-        {
-            "session_id": session_id,
-            "producto": "",
-            "cantidad": 0,
-            "talla": "",
-            "precio_unitario": 0.0,
-            "nombre_cliente": "",
-            "direccion": "",
-            "ciudad": "",
-            "metodo_pago": "",
-            "metodo_entrega": "",
-            "punto_venta": "",
-            "notas": "",
-            "estado": "pendiente",
-            "last_activity": ahora,
-            "datos_personales_advertidos": False,
-            "saludo_enviado": 0,        # se marca a 1 tras enviar el saludo
-            "last_msg_id": None,
-            "sugeridos": "",
-            "ctx_json": "{}",
-            "ultima_categoria": "",
-            "ultimos_filtros": "",
-            "sugeridos_json": "",
-            "carrito_json": "[]",
-            "preferencias_json": "{}",
-        },
-    )
+    # ✅ Reinicio por inactividad (FIX de indentación)
+    if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
+        # Reinicia la sesión/pedido
+        db.query(Pedido).filter(Pedido.session_id == session_id).delete()
+        db.commit()
+        crear_pedido(
+            db,
+            {
+                "session_id": session_id,
+                "producto": "",
+                "cantidad": 0,
+                "talla": "",
+                "precio_unitario": 0.0,
+                "nombre_cliente": "",
+                "direccion": "",
+                "ciudad": "",
+                "metodo_pago": "",
+                "metodo_entrega": "",
+                "punto_venta": "",
+                "notas": "",
+                "estado": "pendiente",
+                "last_activity": ahora,
+                "datos_personales_advertidos": False,
+                "saludo_enviado": 0,        # se marca a 1 tras enviar el saludo
+                "last_msg_id": None,
+                "sugeridos": "",
+                "ctx_json": "{}",
+                "ultima_categoria": "",
+                "ultimos_filtros": "",
+                "sugeridos_json": "",
+                "carrito_json": "[]",
+                "preferencias_json": "{}",
+            },
+        )
 
-    # Saludo inicial (como la primera vez)
-    saludo_inicial = (
-        "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
-        "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
-        "C.C Fabricato – 3103380995\n"
-        "C.C Florida – 3207335493\n"
-        "Centro - Junín – 3207339281\n"
-        "C.C La Central – 3207338021\n"
-        "C.C Mayorca – 3207332984\n"
-        "C.C Premium Plaza – 3207330457\n"
-        "C.C Unicentro – 3103408952"
-    )
+        # Saludo inicial (como la primera vez)
+        saludo_inicial = (
+            "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
+            "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
+            "C.C Fabricato – 3103380995\n"
+            "C.C Florida – 3207335493\n"
+            "Centro - Junín – 3207339281\n"
+            "C.C La Central – 3207338021\n"
+            "C.C Mayorca – 3207332984\n"
+            "C.C Premium Plaza – 3207330457\n"
+            "C.C Unicentro – 3103408952"
+        )
 
-    # Marca el saludo como enviado para no repetirlo enseguida
-    actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
+        # Marca el saludo como enviado para no repetirlo enseguida
+        actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
 
-    return {"response": saludo_inicial}
+        return {"response": saludo_inicial}
 
-
+    # Autoregistro de teléfono desde session_id si aplica
     if not getattr(pedido, "telefono", None) and session_id.startswith("cliente_"):
         telefono_cliente = session_id.replace("cliente_", "")
         actualizar_pedido_por_sesion(db, session_id, "telefono", telefono_cliente)
@@ -1458,6 +1478,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             if productos:
                 filtros = detectar_atributos(cat_txt) or {}
+                # limpia tallas
+                for p in productos:
+                    if isinstance(p, dict) and "tallas_disponibles" in p:
+                        p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                 _remember_list(db, session_id, cat or "", filtros, productos)
                 _append_sugeridos_urls(db, session_id, [p["url"] for p in productos if p.get("url")])
                 return {"response": _formatear_sugerencias(productos[:3])}
@@ -1477,6 +1501,9 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 res = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
                 productos = res.get("productos", [])
                 if productos:
+                    for p in productos:
+                        if isinstance(p, dict) and "tallas_disponibles" in p:
+                            p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                     _set_sugeridos_list(db, session_id, productos)
                     _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
                     return {"response": _formatear_sugerencias(productos[:3])}
@@ -1488,8 +1515,12 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         if productos_previos:
             restantes = productos_previos[3:] if len(productos_previos) > 3 else []
             if restantes:
+                # normaliza tallas
+                for p in restantes:
+                    if isinstance(p, dict) and "tallas_disponibles" in p:
+                        p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                 _set_sugeridos_list(db, session_id, restantes)
-                _append_sugeridos_urls(db, session_id, [p["url"] for p in restantes])
+                _append_sugeridos_urls(db, session_id, [p["url"] for p in restantes if p.get("url")])
                 return {"response": _formatear_sugerencias(restantes)}
             else:
                 return {"response": "Ya te mostré todas las opciones disponibles por ahora. ¿Quieres buscar algo diferente?"}
@@ -1500,13 +1531,13 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
         if ultima_cat:
             partes = [ultima_cat]
-            if ult_filtros.get("subtipo") == "guayabera":
-                partes.append("guayabera")
-            if ult_filtros.get("manga") in ("corta", "larga"):
-                partes.append(f"manga {ult_filtros['manga']}")
-            if ult_filtros.get("color"):
-                partes.append(ult_filtros["color"])
-
+            if isinstance(ult_filtros, dict):
+                if ult_filtros.get("subtipo") == "guayabera":
+                    partes.append("guayabera")
+                if ult_filtros.get("manga") in ("corta", "larga"):
+                    partes.append(f"manga {ult_filtros['manga']}")
+                if ult_filtros.get("color"):
+                    partes.append(ult_filtros["color"])
             consulta = " ".join(partes)
             urls_previas = _get_sugeridos_urls(db, session_id)
 
@@ -1518,6 +1549,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 productos = res2.get("productos", [])
 
             if productos:
+                # normaliza tallas
+                for p in productos:
+                    if isinstance(p, dict) and "tallas_disponibles" in p:
+                        p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                 filtros_persist = ult_filtros if isinstance(ult_filtros, dict) and ult_filtros else detectar_atributos(user_text)
                 _remember_list(db, session_id, ultima_cat, filtros_persist, productos)
                 _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
@@ -1647,41 +1682,22 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             try:
                 cat_local, _ = detectar_categoria(user_text)
                 filtros = detectar_atributos(user_text)
+                for p in productos:
+                    if isinstance(p, dict) and "tallas_disponibles" in p:
+                        p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                 actualizar_pedido_por_sesion(db, session_id, "ultima_categoria", cat_local or "")
                 actualizar_pedido_por_sesion(db, session_id, "ultimos_filtros", json.dumps(filtros, ensure_ascii=False))
                 _set_sugeridos_list(db, session_id, productos)
             except Exception:
                 pass
 
-            _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
+            _append_sugeridos_urls(db, session_id, [p["url"] for p in productos if p.get("url")])
             return {"response": _formatear_sugerencias(productos)}
         else:
             msg = res.get("mensaje") or "No encontré opciones que cumplan lo que pides. ¿Te muestro algo similar?"
             return {"response": msg}
 
-    m = SELECCION_RE.search(user_text)
-    if m:
-        idx_str = next((g for g in m.groups() if g), None)
-        try:
-            idx = int(idx_str)
-        except (TypeError, ValueError):
-            idx = None
-
-        if idx is not None:
-            lista = _get_sugeridos_list(db, session_id)
-            if lista and 1 <= idx <= len(lista):
-                prod = lista[idx - 1]
-                _remember_selection(db, session_id, prod, idx)
-                actualizar_pedido_por_sesion(db, session_id, "producto", prod.get("nombre", ""))
-
-                return {
-                    "response": (
-                        f"Anotado: opción {idx} — {prod.get('nombre', 'Producto')}.\n"
-                        "¿Qué talla necesitas y cuántas unidades?"
-                    )
-                }
-            else:
-                return {"response": "No tengo esa opción disponible. ¿Te muestro nuevas alternativas?"}
+    # (Eliminado el bloque duplicado de SELECCION_RE)
 
     # ======= LLM =======
     resultado = await procesar_conversacion_llm(pedido, user_text)
@@ -1723,6 +1739,9 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             if productos:
                 print("[DBG] Fallback: forzando guardado de productos (no hubo cache_list)")
+                for p in productos:
+                    if isinstance(p, dict) and "tallas_disponibles" in p:
+                        p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                 _remember_list(db, session_id, categoria_detectada or "", filtros or {}, productos)
                 _append_sugeridos_urls(db, session_id, [p["url"] for p in productos if "url" in p])
                 resultado["respuesta"] = _formatear_sugerencias(productos[:3]) + \
@@ -1778,7 +1797,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                     pass
                 elif t == "cache_list":
                     productos = args.get("productos") or []
-                    if isinstance(productos, list) && productos:
+                    if isinstance(productos, list) and productos:
                         # Limpia tallas
                         for p in productos:
                             if isinstance(p, dict) and "tallas_disponibles" in p:
@@ -1840,7 +1859,11 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             lineas = _cart_summary_lines(carrito)
             resultado["respuesta"] = ( "\n".join(lineas) + "\n\n" + (resultado.get("respuesta") or "") ).strip()
 
-    campos_dict = resultado.get("campos", {})
+    # mapeo nombre_completo → nombre_cliente antes de guardar
+    campos_dict = resultado.get("campos", {}) or {}
+    if "nombre_completo" in campos_dict and "nombre_cliente" not in campos_dict:
+        campos_dict["nombre_cliente"] = campos_dict.pop("nombre_completo")
+
     if isinstance(campos_dict, dict):
         if "producto" in campos_dict:
             actualizar_pedido_por_sesion(db, session_id, "talla", "")
@@ -1948,11 +1971,14 @@ async def receive_whatsapp_message(request: Request):
                 db = SessionLocal()
 
                 try:
-                    if _get_last_msg_id(db, session_id)
-                     continue
+                    last = _get_last_msg_id(db, session_id)
+                    if last == msg_id:
+                        # ya procesado este mensaje
+                        continue
 
                     print(f"🧪 Texto recibido: {txt}")
                     res = await mensaje_whatsapp(UserMessage(message=txt), session_id=session_id, db=db)
+                    # marca como procesado ANTES de enviar para evitar reprocesos en reintentos
                     actualizar_pedido_por_sesion(db, session_id, "last_msg_id", msg_id)
                     await enviar_mensaje_whatsapp(num, res["response"])
                 finally:
@@ -1960,11 +1986,13 @@ async def receive_whatsapp_message(request: Request):
     return {"status": "received"}
 
 async def enviar_mensaje_whatsapp(numero: str, mensaje: str):
-    url = f"https://graph.facebook.com/v17.0/{WHATSAPP_PHONE_NUMBER}/messages"
+    url = f"https://graph.facebook.com/{WA_GRAPH_API_VER}/{WHATSAPP_PHONE_NUMBER}/messages"
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": numero, "type": "text", "text": {"body": mensaje}}
     try:
-        requests.post(url, headers=headers, json=payload, timeout=10).raise_for_status()
+        async with httpx.AsyncClient(timeout=10) as client_http:
+            r = await client_http.post(url, headers=headers, json=payload)
+            r.raise_for_status()
         print("✅ Mensaje enviado a WhatsApp")
     except Exception as exc:
         print("❌ Error envío WhatsApp:", exc)
@@ -1980,6 +2008,5 @@ async def test_whatsapp():
     await enviar_mensaje_whatsapp("+573113305646", "🚀 Token nuevo activo. Esta es una prueba en vivo.")
     return {"status": "sent"}
 
+# ---------- INIT ----------
 init_db()
-
-
