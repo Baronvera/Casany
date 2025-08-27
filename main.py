@@ -1239,10 +1239,13 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     if resp_pago:
         return resp_pago
 
-    if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
-        db.query(Pedido).filter(Pedido.session_id == session_id).delete()
-        db.commit()
-        crear_pedido(db, {
+   if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
+    # Reinicia la sesión/pedido
+    db.query(Pedido).filter(Pedido.session_id == session_id).delete()
+    db.commit()
+    crear_pedido(
+        db,
+        {
             "session_id": session_id,
             "producto": "",
             "cantidad": 0,
@@ -1258,31 +1261,36 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             "estado": "pendiente",
             "last_activity": ahora,
             "datos_personales_advertidos": False,
-            "saludo_enviado": 0,
+            "saludo_enviado": 0,        # se marca a 1 tras enviar el saludo
             "last_msg_id": None,
             "sugeridos": "",
-            "ctx_json": "{}",            # ✅ agregado en reinicio
-            "ultima_categoria": "",      # ✅ agregado en reinicio
-            "ultimos_filtros": "",       # ✅ agregado en reinicio
-            "sugeridos_json": "",        # ✅ agregado en reinicio
+            "ctx_json": "{}",
+            "ultima_categoria": "",
+            "ultimos_filtros": "",
+            "sugeridos_json": "",
             "carrito_json": "[]",
             "preferencias_json": "{}",
-        })
-        return {
-            "response": "¡Hola de nuevo! Pasó un buen rato sin actividad, así que reinicié la conversación./n"
-            "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
-            "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
-            "C.C Fabricato – 3103380995\n"
-            "C.C Florida – 3207335493\n"
-            "Centro - Junín – 3207339281\n"
-            "C.C La Central – 3207338021\n"
-            "C.C Mayorca – 3207332984\n"
-            "C.C Premium Plaza – 3207330457\n"
-            "C.C Unicentro – 3103408952"
+        },
     )
-            
-            
-        }
+
+    # Saludo inicial (como la primera vez)
+    saludo_inicial = (
+        "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
+        "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
+        "C.C Fabricato – 3103380995\n"
+        "C.C Florida – 3207335493\n"
+        "Centro - Junín – 3207339281\n"
+        "C.C La Central – 3207338021\n"
+        "C.C Mayorca – 3207332984\n"
+        "C.C Premium Plaza – 3207330457\n"
+        "C.C Unicentro – 3103408952"
+    )
+
+    # Marca el saludo como enviado para no repetirlo enseguida
+    actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
+
+    return {"response": saludo_inicial}
+
 
     if not getattr(pedido, "telefono", None) and session_id.startswith("cliente_"):
         telefono_cliente = session_id.replace("cliente_", "")
@@ -1973,4 +1981,5 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
 
