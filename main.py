@@ -173,10 +173,10 @@ PAGO_RE = re.compile(
     re.I
 )
 CONFIRM_RE = re.compile(
-    r'(confirmar|confirmo|finalizar|cerrar|terminar|listo|realizar|as[ií]\s*est[aá]\s*bien|est[aá]\s*bien)'
-    r'.*(pedido|compra|orden)?|^(s[ií]|ok|dale|listo)\b',
+    r"\b(confirmar|confirmo|finalizar|cerrar|terminar|realizar)\b.*\b(pedido|compra|orden)\b",
     re.I
 )
+
 
 # --- Cantidades (para capturar "1", "una", "dos", etc.) ---
 QTY_WORDS_MAP = {
@@ -1269,7 +1269,19 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             "preferencias_json": "{}",
         })
         return {
-            "response": "¡Hola de nuevo! Pasó un buen rato sin actividad, así que reinicié la conversación. ¿Qué te gustaría ver hoy?"
+            "response": "¡Hola de nuevo! Pasó un buen rato sin actividad, así que reinicié la conversación./n"
+            "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
+            "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
+            "C.C Fabricato – 3103380995\n"
+            "C.C Florida – 3207335493\n"
+            "Centro - Junín – 3207339281\n"
+            "C.C La Central – 3207338021\n"
+            "C.C Mayorca – 3207332984\n"
+            "C.C Premium Plaza – 3207330457\n"
+            "C.C Unicentro – 3103408952"
+    )
+            
+            
         }
 
     if not getattr(pedido, "telefono", None) and session_id.startswith("cliente_"):
@@ -1961,3 +1973,4 @@ async def test_whatsapp():
     return {"status": "sent"}
 
 init_db()
+
