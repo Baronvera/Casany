@@ -1502,7 +1502,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         lineas = _cart_summary_lines(carrito)
         return {"response": "\n".join(lineas)}
 
-       m_fotos = FOTOS_RE.search(user_text)
+    m_fotos = FOTOS_RE.search(user_text)
     if m_fotos:
         if _tiene_atributos_especificos(user_text):
             pass
@@ -2087,4 +2087,5 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
