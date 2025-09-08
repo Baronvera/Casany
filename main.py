@@ -1,5 +1,5 @@
 # main.py
-APP_BUILD = "build_09"
+APP_BUILD = "build_10"
 
 import os
 import json
@@ -7,11 +7,15 @@ import re
 import unicodedata
 import requests  # se mantiene por compatibilidad, aunque ya usamos httpx para WhatsApp
 import httpx
+import hmac
+import hashlib
+import random
+import string
 from datetime import datetime, timedelta, timezone
 from typing import Literal, Optional, List
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
 from pydantic import BaseModel, EmailStr
@@ -37,6 +41,28 @@ load_dotenv(override=True)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_PROJECT_ID = os.getenv("OPENAI_PROJECT_ID")  # opcional
 WA_GRAPH_API_VER = os.getenv("WA_GRAPH_API_VER", "v17.0")
+
+# --- ENV centralizados (cuentas, teléfonos, textos) ---
+ALERTA_WHATSAPP = os.getenv("ALERTA_WHATSAPP", "+573113305646")
+CTA_BANCOLOMBIA = os.getenv("CTA_BANCOLOMBIA", "27480228756")
+CTA_DAVIVIENDA = os.getenv("CTA_DAVIVIENDA", "037169997501")
+TIENDAS_WHATS = os.getenv(
+    "TIENDAS_WHATS",
+    "C.C Fabricato – 3103380995\n"
+    "C.C Florida – 3207335493\n"
+    "Centro - Junín – 3207339281\n"
+    "C.C La Central – 3207338021\n"
+    "C.C Mayorca – 3207332984\n"
+    "C.C Premium Plaza – 3207330457\n"
+    "C.C Unicentro – 3103408952"
+)
+SALUDO_BASE = os.getenv(
+    "SALUDO_BASE",
+    "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
+    "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
+    + TIENDAS_WHATS
+)
+WA_APP_SECRET = os.getenv("WA_APP_SECRET", "")
 
 client = None
 if OPENAI_API_KEY:
@@ -104,7 +130,6 @@ def _safe_json_load(s: str, default):
         return json.loads(s) if s else default
     except Exception:
         return default
-
 
 #  Reglas / constantes
 SUPPORT_START_HOUR, SUPPORT_END_HOUR = 9, 19
@@ -180,7 +205,7 @@ CONFIRM_RE = re.compile(
     re.I
 )
 
-# --- Cantidades (para capturar "1", "una", "dos", etc.) ---
+# --- Cantidades ---
 QTY_WORDS_MAP = {
     "un": 1, "uno": 1, "una": 1,
     "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5,
@@ -219,9 +244,9 @@ app.add_middleware(
 app.include_router(agent_router)
 
 def _fmt_cop(v: float) -> str:
-    """Formatea a COP con punto como separador de miles."""
+    """Formatea a COP con separador de miles y 0 decimales."""
     try:
-        return f"${int(float(v)):,}".replace(",", ".")
+        return f"${float(v):,.0f}".replace(",", ".")
     except Exception:
         return "$0"
 
@@ -252,8 +277,8 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
             return {
                 "response": (
                     "Perfecto. Realiza la transferencia y envía el comprobante por este chat:\n"
-                    "- Bancolombia: Cuenta Corriente No. 27480228756\n"
-                    "- Davivienda: Cuenta Corriente No. 037169997501\n\n"
+                    f"- Bancolombia: Cuenta Corriente No. {CTA_BANCOLOMBIA}\n"
+                    f"- Davivienda: Cuenta Corriente No. {CTA_DAVIVIENDA}\n\n"
                     "Apenas lo recibamos, confirmamos tu pedido. ¿Deseas agregar algo más mientras tanto?"
                 )
             }
@@ -278,14 +303,20 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
 
     if confirm_match or (intent_det["intent"] == "confirmar" and intent_det["confidence"] >= 0.6):
         actualizar_pedido_por_sesion(db, session_id, "estado", "confirmado")
+        # Genera número de confirmación si falta
         pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
+        if not getattr(pedido_actualizado, "numero_confirmacion", None):
+            numero = _gen_numero_confirmacion()
+            actualizar_pedido_por_sesion(db, session_id, "numero_confirmacion", numero)
+            pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
+
         try:
             enviar_pedido_a_hubspot(pedido_actualizado)
         except Exception:
             pass
         try:
             mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
-            await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
+            await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, mensaje_alerta)
         except Exception:
             pass
 
@@ -297,7 +328,8 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
 
         return {
             "response": (
-                f"¡Pedido confirmado!\n\nResumen:\n{resumen}\n\n"
+                f"¡Pedido confirmado!\n\nNúmero de confirmación: {pedido_actualizado.numero_confirmacion}\n\n"
+                f"Resumen:\n{resumen}\n\n"
                 f"Entrega: {metodo_entrega or 'pendiente'}\n"
                 f"Pago: {metodo_pago or 'pendiente'}\n\n"
                 "Te contactaremos en breve para coordinar el siguiente paso. "
@@ -418,6 +450,7 @@ _ensure_column("carrito_json",
 _ensure_column("preferencias_json",
     "ALTER TABLE pedidos ADD COLUMN preferencias_json TEXT")
 _ensure_column("filtros", "ALTER TABLE pedidos ADD COLUMN filtros TEXT")
+_ensure_column("numero_confirmacion", "ALTER TABLE pedidos ADD COLUMN numero_confirmacion TEXT")
 
 def _normalize_nulls():
     db = SessionLocal()
@@ -427,10 +460,10 @@ def _normalize_nulls():
         db.execute(sa_text("UPDATE pedidos SET sugeridos='' WHERE sugeridos IS NULL"))
         db.execute(sa_text("UPDATE pedidos SET ultima_categoria='' WHERE ultima_categoria IS NULL"))
         db.execute(sa_text("UPDATE pedidos SET ultimos_filtros='' WHERE ultimos_filtros IS NULL"))
-        db.execute(sa_text("UPDATE pedidos SET sugeridos_json='' WHERE sugeridos_json IS NULL"))
-        db.execute(sa_text("UPDATE pedidos SET ctx_json='' WHERE ctx_json IS NULL"))
-        db.execute(sa_text("UPDATE pedidos SET carrito_json='[]' WHERE carrito_json IS NULL"))
-        db.execute(sa_text("UPDATE pedidos SET preferencias_json='{}' WHERE preferencias_json IS NULL"))
+        db.execute(sa_text("UPDATE pedidos SET sugeridos_json='[]' WHERE sugeridos_json IS NULL OR TRIM(sugeridos_json)=''"))
+        db.execute(sa_text("UPDATE pedidos SET ctx_json='{}' WHERE ctx_json IS NULL OR TRIM(ctx_json)=''"))
+        db.execute(sa_text("UPDATE pedidos SET carrito_json='[]' WHERE carrito_json IS NULL OR TRIM(carrito_json)=''"))
+        db.execute(sa_text("UPDATE pedidos SET preferencias_json='{}' WHERE preferencias_json IS NULL OR TRIM(preferencias_json)=''"))
         db.commit()
     except Exception:
         db.rollback()
@@ -512,6 +545,9 @@ def _get_sugeridos_list(db: Session, session_id: str) -> List[dict]:
             sa_text("SELECT sugeridos_json FROM pedidos WHERE session_id=:sid"),
             {"sid": session_id},
         ).fetchone()
+    except Exception:
+        return []
+    try:
         return json.loads(row[0]) if row and row[0] else []
     except Exception:
         return []
@@ -787,6 +823,68 @@ def _clean_json(texto: str) -> dict:
             "campos": {},
             "respuesta": "Puedo continuar con tu compra. ¿Quieres que agregue el producto que te gustó al carrito o prefieres ver el carrito primero?",
         }
+
+def _gen_numero_confirmacion(prefix="CAS"):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d")
+    suf = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"{prefix}-{ts}-{suf}"
+
+def _pedido_missing_fields(pedido) -> list:
+    faltan = []
+    if not getattr(pedido, "nombre_cliente", None):
+        faltan.append("nombre_cliente")
+
+    met_ent = (getattr(pedido, "metodo_entrega", "") or "").strip()
+    if not met_ent:
+        faltan.append("metodo_entrega")
+    else:
+        if met_ent == "domicilio":
+            if not getattr(pedido, "direccion", None):
+                faltan.append("direccion")
+            if not getattr(pedido, "ciudad", None):
+                faltan.append("ciudad")
+        elif met_ent == "recoger_en_tienda":
+            if not getattr(pedido, "punto_venta", None):
+                faltan.append("punto_venta")
+
+    if not getattr(pedido, "producto", None):
+        faltan.append("producto")
+    if (getattr(pedido, "producto", None)) and not (getattr(pedido, "cantidad", 0) or 0) and not _ctx_load(pedido).get("awaiting_qty"):
+        faltan.append("cantidad")
+
+    if not getattr(pedido, "metodo_pago", None):
+        faltan.append("metodo_pago")
+
+    return faltan
+
+def _prompt_for_missing(pedido, faltan: list) -> str:
+    if not faltan:
+        return ""
+    f = faltan[0]
+    if f == "nombre_cliente":
+        return "¿Cómo te llamas? (nombre y apellido)"
+    if f == "metodo_entrega":
+        return "¿Prefieres envío a domicilio o recoger en tienda?"
+    if f == "direccion":
+        return ("Antes de continuar, recuerda que tus datos se tratan bajo nuestra política: "
+                "https://cassany.co/tratamiento-de-datos-personales/\n"
+                "¿Cuál es tu dirección de envío?")
+    if f == "ciudad":
+        return "¿En qué ciudad se realizará el envío?"
+    if f == "punto_venta":
+        tiendas = "\n".join(PUNTOS_VENTA)
+        return f"¿En cuál tienda deseas recoger tu pedido?\n{tiendas}"
+    if f == "producto":
+        cats = ", ".join(CATEGORIAS_RESUMEN[:4]) + "…"
+        return f"¿Qué te gustaría ver primero? Tenemos {cats}"
+    if f == "cantidad":
+        return "¿Cuántas unidades deseas?"
+    if f == "metodo_pago":
+        return ("¿Qué método de pago prefieres?\n"
+                "- Transferencia (Bancolombia/Davivienda)\n"
+                "- PayU (link de pago)\n"
+                "- Pago en tienda")
+    return "¿Te parece si seguimos con el siguiente paso?"
 
 async def procesar_conversacion_llm(pedido, texto_usuario: str):
     if client is None:
@@ -1087,9 +1185,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             "ctx_json": "{}",            # ✅ asegurado
             "ultima_categoria": "",      # ✅ asegurado
             "ultimos_filtros": "",       # ✅ asegurado
-            "sugeridos_json": "",        # ✅ asegurado
+            "sugeridos_json": "[]",      # ✅ asegurado
             "carrito_json": "[]",
             "preferencias_json": "{}",
+            "numero_confirmacion": "",
         })
         pedido = obtener_pedido_por_sesion(db, session_id)
 
@@ -1130,7 +1229,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         if pv:
             prod = _resolve_product_ref(db, session_id, pv.get("ref") or pv.get("sku"))
             if prod:
-                # valida coherencia de talla si el producto la lista
                 tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
                 if tallas and filtros_detectados["talla"] not in tallas:
                     return {"response": f"Para «{prod.get('nombre','Producto')}» tengo {', '.join(tallas)}. ¿Quieres elegir una de esas tallas?"}
@@ -1150,7 +1248,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                     actualizar_pedido_por_sesion(db, session_id, "subtotal", _cart_total(carrito))
                 except Exception:
                     pass
-                # Limpia el pendiente
                 ctx.pop("pending_variant", None)
                 _ctx_save(db, session_id, ctx)
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
@@ -1183,10 +1280,9 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 ctx_qty.pop("awaiting_qty", None)
                 _ctx_save(db, session_id, ctx_qty)
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
-        # Si no encontramos número claro, repreguntamos
         return {"response": "¿Cuántas unidades deseas? (por ejemplo: 1, 2 o 3)"}
 
-    # ✅ Fast-path: “talla L” (o 38) para la última selección SIN pedir lista de nuevo
+    # ✅ Fast-path talla sola
     m_talla_solo = TALLA_TOKEN_RE.search(user_text)
     if m_talla_solo and not MOSTRAR_RE.search(user_text) and not SELECCION_RE.search(user_text) and not ORDINAL_RE.search(user_text):
         talla_elegida = (m_talla_solo.group(1) or "").upper()
@@ -1217,24 +1313,29 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                     pass
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
-    # ✅ Confirmación corta basada en contexto (sí/ok/dale/así está bien)
+    # ✅ Confirmación corta basada en contexto
     ctx_tmp = _ctx_load(pedido)
     if ctx_tmp.get("awaiting_confirmation"):
         if re.search(r'^(s[ií]|ok|dale|listo|de acuerdo|est(a|á)\s*bien|as(i|í)\s*est(a|á)\s*bien)\b', user_text, re.I):
             actualizar_pedido_por_sesion(db, session_id, "estado", "confirmado")
+            # genera número si falta
+            pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
+            if not getattr(pedido_actualizado, "numero_confirmacion", None):
+                numero = _gen_numero_confirmacion()
+                actualizar_pedido_por_sesion(db, session_id, "numero_confirmacion", numero)
+                pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
             try:
                 ctx_tmp.pop("awaiting_confirmation", None)
                 _ctx_save(db, session_id, ctx_tmp)
             except Exception:
                 pass
-            pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
             try:
                 enviar_pedido_a_hubspot(pedido_actualizado)
             except Exception:
                 pass
             try:
                 mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
-                await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
+                await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, mensaje_alerta)
             except Exception:
                 pass
 
@@ -1245,7 +1346,8 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             return {
                 "response": (
-                    f"¡Pedido confirmado!\n\nResumen:\n{resumen}\n\n"
+                    f"¡Pedido confirmado!\n\nNúmero de confirmación: {pedido_actualizado.numero_confirmacion}\n\n"
+                    f"Resumen:\n{resumen}\n\n"
                     f"Entrega: {metodo_entrega or 'pendiente'}\n"
                     f"Pago: {metodo_pago or 'pendiente'}\n\n"
                     "Te contactaremos en breve para coordinar el siguiente paso. "
@@ -1253,14 +1355,13 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 )
             }
 
-    # ✅ Manejo de pago/confirmación (router híbrido): antes de cualquier otra cosa
+    # ✅ Manejo de pago/confirmación (router híbrido)
     resp_pago = await procesar_mensaje_usuario(user_text, db, session_id, pedido)
     if resp_pago:
         return resp_pago
 
-    # ✅ Reinicio por inactividad (FIX de indentación)
+    # ✅ Reinicio por inactividad
     if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
-        # Reinicia la sesión/pedido
         db.query(Pedido).filter(Pedido.session_id == session_id).delete()
         db.commit()
         crear_pedido(
@@ -1281,35 +1382,20 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 "estado": "pendiente",
                 "last_activity": ahora,
                 "datos_personales_advertidos": False,
-                "saludo_enviado": 0,        # se marca a 1 tras enviar el saludo
+                "saludo_enviado": 0,
                 "last_msg_id": None,
                 "sugeridos": "",
                 "ctx_json": "{}",
                 "ultima_categoria": "",
                 "ultimos_filtros": "",
-                "sugeridos_json": "",
+                "sugeridos_json": "[]",
                 "carrito_json": "[]",
                 "preferencias_json": "{}",
+                "numero_confirmacion": "",
             },
         )
-
-        # Saludo inicial (como la primera vez)
-        saludo_inicial = (
-            "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
-            "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
-            "C.C Fabricato – 3103380995\n"
-            "C.C Florida – 3207335493\n"
-            "Centro - Junín – 3207339281\n"
-            "C.C La Central – 3207338021\n"
-            "C.C Mayorca – 3207332984\n"
-            "C.C Premium Plaza – 3207330457\n"
-            "C.C Unicentro – 3103408952"
-        )
-
-        # Marca el saludo como enviado para no repetirlo enseguida
         actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
-
-        return {"response": saludo_inicial}
+        return {"response": SALUDO_BASE}
 
     # Autoregistro de teléfono desde session_id si aplica
     if not getattr(pedido, "telefono", None) and session_id.startswith("cliente_"):
@@ -1317,7 +1403,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         actualizar_pedido_por_sesion(db, session_id, "telefono", telefono_cliente)
 
     if pedido and pedido.estado == "cancelado":
-        if SALUDO_RE.match(user_text):  # ✅ unificado con SALUDO_RE
+        if SALUDO_RE.match(user_text):
             db.query(Pedido).filter(Pedido.session_id == session_id).delete()
             db.commit()
             crear_pedido(db, {
@@ -1342,39 +1428,18 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 "ctx_json": "{}",            # ✅
                 "ultima_categoria": "",      # ✅
                 "ultimos_filtros": "",       # ✅
-                "sugeridos_json": "",        # ✅
+                "sugeridos_json": "[]",      # ✅
                 "carrito_json": "[]",
                 "preferencias_json": "{}",
+                "numero_confirmacion": "",
             })
-            return {
-                "response": (
-                    "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
-                    "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia:\n\n"
-                    "C.C Fabricato – 3103380995\n"
-                    "C.C Florida – 3207335493\n"
-                    "Centro - Junín – 3207339281\n"
-                    "C.C La Central – 3207338021\n"
-                    "C.C Mayorca – 3207332984\n"
-                    "C.C Premium Plaza – 3207330457\n"
-                    "C.C Unicentro – 3103408952"
-                )
-            }
-        return {
-            "response": (
-                "No tienes ningún pedido activo en este momento. "
-                "Escribe ‘hola’ cuando quieras comenzar una nueva compra."
-            )
-        }
+            return {"response": SALUDO_BASE}
+        return {"response": "No tienes ningún pedido activo en este momento. Escribe ‘hola’ cuando quieras comenzar una nueva compra."}
 
     if detectar_intencion_atencion(user_text):
         mensaje_alerta = generar_mensaje_atencion_humana(pedido)
-        await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
-        return {
-            "response": (
-                "Entendido, ya te pongo en contacto con uno de nuestros asesores. "
-                "Te responderán personalmente en breve para ayudarte con lo que necesitas."
-            )
-        }
+        await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, mensaje_alerta)
+        return {"response": "Entendido, ya te pongo en contacto con uno de nuestros asesores. Te responderán personalmente en breve para ayudarte con lo que necesitas."}
 
     if any(neg in user_text for neg in ["ya no quiero", "cancelar pedido", "no deseo", "me arrepentí", "me arrepenti"]):
         producto_cancelado = pedido.producto or "el pedido actual"
@@ -1384,26 +1449,12 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         actualizar_pedido_por_sesion(db, session_id, "cantidad", 0)
         actualizar_pedido_por_sesion(db, session_id, "metodo_entrega", "")
         actualizar_pedido_por_sesion(db, session_id, "punto_venta", "")
-        return {
-            "response": f"Entiendo, he cancelado {producto_cancelado}. ¿Te gustaría ver otra prenda o necesitas ayuda con algo más?"
-        }
+        return {"response": f"Entiendo, he cancelado {producto_cancelado}. ¿Te gustaría ver otra prenda o necesitas ayuda con algo más?"}
 
     if SALUDO_RE.match(user_text):
         if _get_saludo_enviado(db, session_id) == 0:
             actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
-            return {
-                "response": (
-                    "Bienvenido a CASSANY. Estoy aquí para ayudarte con tu compra.\n"
-                    "Si prefieres, también puedes comunicarte directamente con la tienda de tu preferencia por WhatsApp.\n\n"
-                    "C.C Fabricato – 3103380995\n"
-                    "C.C Florida – 3207335493\n"
-                    "Centro - Junín – 3207339281\n"
-                    "C.C La Central – 3207338021\n"
-                    "C.C Mayorca – 3207332984\n"
-                    "C.C Premium Plaza – 3207330457\n"
-                    "C.C Unicentro – 3103408952"
-                )
-            }
+            return {"response": SALUDO_BASE}
         return {"response": "¡Hola! ¿Qué te gustaría ver hoy: camisas, jeans, pantalones o suéteres?"}
 
     if DOMICILIO_RE.search(user_text):
@@ -1427,23 +1478,11 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
     if SMALLTALK_RE.search(user_text):
         cats = ", ".join(CATEGORIAS_RESUMEN[:4]) + "…"
-        return {
-            "response": (
-                f"¡Con gusto! ¿Te muestro algo hoy? Tenemos {cats} "
-                "¿Qué prefieres ver primero?"
-            )
-        }
+        return {"response": f"¡Con gusto! ¿Te muestro algo hoy? Tenemos {cats} ¿Qué prefieres ver primero?"}
 
     if OFFTOPIC_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
-        return {
-            "response": (
-                "Somos CASSANY, una marca de ropa para hombre. "
-                "Trabajamos estas categorías:\n"
-                f"{cats}\n\n"
-                "¿Te muestro camisas o prefieres otra categoría?"
-            )
-        }
+        return {"response": "Somos CASSANY, una marca de ropa para hombre. Trabajamos estas categorías:\n" + f"{cats}\n\n" + "¿Te muestro camisas o prefieres otra categoría?"}
 
     if DISCOVERY_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
@@ -1463,7 +1502,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         lineas = _cart_summary_lines(carrito)
         return {"response": "\n".join(lineas)}
 
-    m_fotos = FOTOS_RE.search(user_text)
+       m_fotos = FOTOS_RE.search(user_text)
     if m_fotos:
         if _tiene_atributos_especificos(user_text):
             pass
@@ -1478,7 +1517,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
             if productos:
                 filtros = detectar_atributos(cat_txt) or {}
-                # limpia tallas
                 for p in productos:
                     if isinstance(p, dict) and "tallas_disponibles" in p:
                         p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
@@ -1505,7 +1543,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                         if isinstance(p, dict) and "tallas_disponibles" in p:
                             p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                     _set_sugeridos_list(db, session_id, productos)
-                    _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
+                    _append_sugeridos_urls(db, session_id, [p["url"] for p in productos if p.get("url")])
                     return {"response": _formatear_sugerencias(productos[:3])}
             cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
             return {"response": f"¿Qué te muestro primero?\n{cats}"}
@@ -1515,7 +1553,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         if productos_previos:
             restantes = productos_previos[3:] if len(productos_previos) > 3 else []
             if restantes:
-                # normaliza tallas
                 for p in restantes:
                     if isinstance(p, dict) and "tallas_disponibles" in p:
                         p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
@@ -1549,13 +1586,12 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 productos = res2.get("productos", [])
 
             if productos:
-                # normaliza tallas
                 for p in productos:
                     if isinstance(p, dict) and "tallas_disponibles" in p:
                         p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
                 filtros_persist = ult_filtros if isinstance(ult_filtros, dict) and ult_filtros else detectar_atributos(user_text)
                 _remember_list(db, session_id, ultima_cat, filtros_persist, productos)
-                _append_sugeridos_urls(db, session_id, [p["url"] for p in productos])
+                _append_sugeridos_urls(db, session_id, [p["url"] for p in productos if p.get("url")])
                 return {"response": _formatear_sugerencias(productos)}
             else:
                 msg = (res.get("mensaje") if isinstance(res, dict) else None) or \
@@ -1600,7 +1636,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
             if tallas:
                 return {"response": f"Listo, seleccionaste la opción {idx0+1}. Tallas disponibles: {', '.join(tallas)}. ¿Cuál prefieres?"}
-            # No requiere tallas -> pedir cantidad y marcar contexto
             ctx_set = _ctx_load(pedido)
             ctx_set["awaiting_qty"] = {
                 "ref": idx0 + 1,
@@ -1655,7 +1690,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
                 if tallas:
                     return {"response": f"Listo, seleccionaste la opción {idx+1}. Tallas disponibles: {', '.join(tallas)}. ¿Cuál prefieres?"}
-                # No requiere tallas -> pedir cantidad y marcar contexto
                 ctx_set = _ctx_load(pedido)
                 ctx_set["awaiting_qty"] = {
                     "ref": idx + 1,
@@ -1696,8 +1730,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         else:
             msg = res.get("mensaje") or "No encontré opciones que cumplan lo que pides. ¿Te muestro algo similar?"
             return {"response": msg}
-
-    # (Eliminado el bloque duplicado de SELECCION_RE)
 
     # ======= LLM =======
     resultado = await procesar_conversacion_llm(pedido, user_text)
@@ -1798,7 +1830,6 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
                 elif t == "cache_list":
                     productos = args.get("productos") or []
                     if isinstance(productos, list) and productos:
-                        # Limpia tallas
                         for p in productos:
                             if isinstance(p, dict) and "tallas_disponibles" in p:
                                 p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
@@ -1874,6 +1905,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         if ("talla" in campos_dict) or ("cantidad" in campos_dict):
             _update_last_selection_from_pedido(db, session_id)
 
+    # Preguntas específicas según campos recién seteados
     if campos_dict.get("metodo_entrega") == "recoger_en_tienda" and not campos_dict.get("punto_venta"):
         tiendas = "\n".join(PUNTOS_VENTA)
         return {"response": f"Por favor, confirma en cuál de nuestras tiendas deseas recoger tu pedido:\n{tiendas}"}
@@ -1892,12 +1924,18 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         return {"response": "Perfecto, por favor indícame tu dirección y ciudad para el envío."}
 
     if campos_dict.get("direccion") and campos_dict.get("ciudad"):
+        # Disparo oportunista a HubSpot (no bloqueante)
+        try:
+            pedido_tmp = obtener_pedido_por_sesion(db, session_id)
+            enviar_pedido_a_hubspot(pedido_tmp)
+        except Exception:
+            pass
         return {
             "response": (
                 "Perfecto, he registrado tu dirección y ciudad.\n\n"
                 "Por favor, confirma el método de pago que prefieres:\n"
-                "- Transferencia a Bancolombia: Cuenta Corriente No. 27480228756\n"
-                "- Transferencia a Davivienda: Cuenta Corriente No. 037169997501\n"
+                f"- Transferencia a Bancolombia: Cuenta Corriente No. {CTA_BANCOLOMBIA}\n"
+                f"- Transferencia a Davivienda: Cuenta Corriente No. {CTA_DAVIVIENDA}\n"
                 "- Pago con PayU desde nuestro sitio web."
             )
         }
@@ -1912,15 +1950,29 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
     if campos_dict.get("estado") == "confirmado":
         pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
+        if not getattr(pedido_actualizado, "numero_confirmacion", None):
+            numero = _gen_numero_confirmacion()
+            actualizar_pedido_por_sesion(db, session_id, "numero_confirmacion", numero)
+            pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
         try:
             enviar_pedido_a_hubspot(pedido_actualizado)
         except Exception:
             pass
         try:
             mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
-            await enviar_mensaje_whatsapp("+573113305646", mensaje_alerta)
+            await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, mensaje_alerta)
         except Exception:
             pass
+
+    # --- Verificador de faltantes críticos (pide 1 cosa a la vez) ---
+    pedido_refresco = obtener_pedido_por_sesion(db, session_id)
+    faltan = _pedido_missing_fields(pedido_refresco)
+    if faltan:
+        pregunta = _prompt_for_missing(pedido_refresco, faltan)
+        if pregunta:
+            base = resultado.get("respuesta") or ""
+            sep = "\n\n" if base else ""
+            return {"response": (base + sep + pregunta).strip()}
 
     return {"response": resultado.get("respuesta", "Disculpa, ocurrió un error.")}
 
@@ -1939,19 +1991,44 @@ def verify_webhook(
         return Response(content=hub_challenge, media_type="text/plain")
     raise HTTPException(400, "Token de verificación inválido.")
 
+def _verify_wa_signature(raw_body: bytes, signature_256: str) -> bool:
+    """
+    Verifica la firma 'X-Hub-Signature-256' con el WA_APP_SECRET.
+    """
+    if not WA_APP_SECRET:
+        return True  # si no hay secreto configurado, permitir (modo dev)
+    if not signature_256:
+        return False
+    try:
+        mac = hmac.new(WA_APP_SECRET.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256)
+        expected = "sha256=" + mac.hexdigest()
+        # tiempo-constante
+        return hmac.compare_digest(expected, signature_256)
+    except Exception:
+        return False
+
 @app.post("/webhook")
-async def receive_whatsapp_message(request: Request):
-    data = await request.json()
+async def receive_whatsapp_message(
+    request: Request,
+    x_hub_signature_256: Optional[str] = Header(None, convert_underscores=False),
+):
+    raw = await request.body()
+    if not _verify_wa_signature(raw, x_hub_signature_256 or ""):
+        raise HTTPException(403, "Firma inválida")
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        data = {}
     print("📥 MENSAJE RECIBIDO DE WHATSAPP:\n", data)
 
     for entry in data.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {}) or {}
             if value.get("statuses"):
-                continue
+                continue  # ignorar acuses de entrega
 
             for msg in value.get("messages", []):
-                # Soporte básico: texto e interactivos (botón/lista)
                 msg_type = msg.get("type")
                 if msg_type not in ("text", "interactive"):
                     continue
@@ -2005,8 +2082,9 @@ def version():
 
 @app.get("/test-whatsapp")
 async def test_whatsapp():
-    await enviar_mensaje_whatsapp("+573113305646", "🚀 Token nuevo activo. Esta es una prueba en vivo.")
+    await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, "🚀 Token nuevo activo. Esta es una prueba en vivo.")
     return {"status": "sent"}
 
 # ---------- INIT ----------
 init_db()
+
