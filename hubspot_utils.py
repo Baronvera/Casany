@@ -6,7 +6,7 @@ import json
 import hashlib
 import requests
 from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,6 +16,9 @@ HUBSPOT_TOKEN = os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip()
 HS_DEFAULT_OWNER_ID = os.getenv("HS_DEFAULT_OWNER_ID", "").strip()
 HS_TASK_ASSOC_CONTACTS = os.getenv("HS_TASK_ASSOC_CONTACTS", "1").strip() == "1"
 HS_UPSERT_CONTACTS = os.getenv("HS_UPSERT_CONTACTS", "0").strip() == "1"
+HS_TASK_DUE_HOURS = int(os.getenv("HS_TASK_DUE_HOURS", "2"))  # vencimiento por defecto: ahora + 2h
+ASSOC_OBJECTS_DEFAULT = "https://api.hubapi.com/crm/v4/objects/{from_obj}/{from_id}/associations/default/{to_obj}/{to_id}"
+
 
 # Endpoints
 BASE_CONTACTS   = "https://api.hubapi.com/crm/v3/objects/contacts"
@@ -199,18 +202,18 @@ def _build_task_body(pedido) -> str:
     store          = _safe(getattr(pedido, "punto_venta", None)) or "N/A"
 
     customer_name  = _safe(getattr(pedido, "nombre_cliente", None)) or "[Sin nombre]"
-    raw_phone      = getattr(pedido, "telefono", "") or (_safe(getattr(pedido, "session_id", "")) or "").replace("cliente_", "").replace("cliente", "")
+    raw_phone      = getattr(pedido, "telefono", "") or (safe(getattr(pedido, "session_id", "")) or "").replace("cliente", "").replace("cliente", "")
     customer_phone = _to_e164_tel(raw_phone)
     customer_email = _safe(getattr(pedido, "email", None)) or "(no disponible)"
     customer_doc   = _safe(getattr(pedido, "tipo_documento", None)) or "(no disponible)"
 
-    delivery_method  = (_safe(getattr(pedido, "metodo_entrega", None)) or "por definir").replace("_", " ")
+    delivery_method  = (safe(getattr(pedido, "metodo_entrega", None)) or "por definir").replace("", " ")
     delivery_address = _safe(getattr(pedido, "direccion", None)) or "(no disponible)"
     delivery_city    = _safe(getattr(pedido, "ciudad", None)) or ""
     if delivery_city and delivery_city not in delivery_address:
         delivery_address = (delivery_address if delivery_address != "(no disponible)" else "") + (f" - {delivery_city}" if delivery_city else "")
 
-    payment_method    = (_safe(getattr(pedido, "metodo_pago", None)) or "por definir").replace("_", " ").capitalize()
+    payment_method    = (safe(getattr(pedido, "metodo_pago", None)) or "por definir").replace("", " ").capitalize()
     payment_status    = _safe(getattr(pedido, "estado_pago", None)) or "pendiente"
     payment_reference = _safe(getattr(pedido, "referencia_pago", None)) or "(no disponible)"
 
@@ -324,7 +327,7 @@ def _build_email_from_phone(session_id: Optional[str], telefono: Optional[str]) 
     return f"guest_{int(time.time())}@cassany.co"
 
 def _prepare_contact_properties(pedido) -> Dict[str, Any]:
-    telefono_raw = getattr(pedido, "telefono", None) or _safe(getattr(pedido, "session_id", "")).replace("cliente_", "").replace("cliente", "")
+    telefono_raw = getattr(pedido, "telefono", None) or safe(getattr(pedido, "session_id", "")).replace("cliente", "").replace("cliente", "")
     plain57, plus57 = _norm_phone_variants(telefono_raw)
     email_real = _safe(getattr(pedido, "email", ""))
     email = email_real or _build_email_from_phone(getattr(pedido, "session_id", None), telefono_raw)
@@ -354,7 +357,7 @@ def _upsert_contact_and_get_id(pedido) -> Optional[str]:
 
     props = _prepare_contact_properties(pedido)
     email = props.get("email", "")
-    telefono_raw = getattr(pedido, "telefono", None) or _safe(getattr(pedido, "session_id", "")).replace("cliente_", "").replace("cliente", "")
+    telefono_raw = getattr(pedido, "telefono", None) or safe(getattr(pedido, "session_id", "")).replace("cliente", "").replace("cliente", "")
     phone_variants = _norm_phone_variants(telefono_raw)
 
     # Intentar encontrar primero
@@ -410,11 +413,29 @@ def _get_assoc_type_id(from_obj: str, to_obj: str) -> int:
         return results[0]["typeId"]
     raise RuntimeError(f"No se halló associationTypeId para {from_obj}->{to_obj}")
 
-def _associate_objects(from_obj: str, from_id: str, to_obj: str, to_id: str):
-    type_id = _get_assoc_type_id(from_obj, to_obj)
-    url = ASSOC_OBJECTS.format(from_obj=from_obj, from_id=from_id, to_obj=to_obj, to_id=to_id)
-    body = {"types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": type_id}]}
+def _associate_objects(from_obj: str, from_id: str, to_obj: str, to_id: str, *, labeled: bool = False):
+    """
+    v4 associations:
+    - Default (unlabeled): PUT .../associations/default/...   # sin body
+    - Labeled:            PUT .../associations/...            # body = [ {associationCategory, associationTypeId} ]
+    """
     try:
+        if not labeled:
+            # ✅ Opción simple: asociación por defecto, SIN body
+            url = ASSOC_OBJECTS_DEFAULT.format(from_obj=from_obj, from_id=from_id, to_obj=to_obj, to_id=to_id)
+            r = _request_with_retry("PUT", url, json_payload=None, timeout=10)
+            r.raise_for_status()
+            return
+
+        # ✅ Opción con etiqueta (solo si realmente la necesitas)
+        type_id = _get_assoc_type_id(from_obj, to_obj)
+        url = ASSOC_OBJECTS.format(from_obj=from_obj, from_id=from_id, to_obj=to_obj, to_id=to_id)
+        body = [
+            {
+                "associationCategory": "HUBSPOT_DEFINED",
+                "associationTypeId": type_id
+            }
+        ]
         r = _request_with_retry("PUT", url, json_payload=body, timeout=10)
         r.raise_for_status()
     except Exception as e:
@@ -425,6 +446,7 @@ def _associate_objects(from_obj: str, from_id: str, to_obj: str, to_id: str):
                 print("❌ HubSpot association error:", repr(e))
         except Exception:
             print("❌ HubSpot association error:", repr(e))
+
 
 # ---------- Tasks (buscar / crear / actualizar) ----------
 def _search_task_by_subject(subject: str) -> Optional[str]:
@@ -450,6 +472,10 @@ def _search_task_by_subject(subject: str) -> Optional[str]:
         print("❌ HubSpot search task error:", repr(e))
     return None
 
+def _now_epoch_ms_plus(hours: int = 0) -> int:
+    return int((datetime.now(timezone.utc) + timedelta(hours=hours)).timestamp() * 1000)
+
+
 def _create_task(subject: str, body_text: str) -> Optional[str]:
     payload = {
         "properties": {
@@ -457,6 +483,7 @@ def _create_task(subject: str, body_text: str) -> Optional[str]:
             "hs_task_body": body_text,
             "hs_task_status": "NOT_STARTED",
             "hs_task_priority": "HIGH",
+            "hs_timestamp": _now_epoch_ms_plus(HS_TASK_DUE_HOURS),
         }
     }
     if HS_DEFAULT_OWNER_ID:
@@ -529,7 +556,7 @@ def enviar_pedido_a_hubspot(pedido) -> bool:
                 contact_id = _upsert_contact_and_get_id(pedido)
             else:
                 # Solo buscar, NO crear
-                telefono_raw = getattr(pedido, "telefono", None) or _safe(getattr(pedido, "session_id", "")).replace("cliente_", "").replace("cliente", "")
+                telefono_raw = getattr(pedido, "telefono", None) or safe(getattr(pedido, "session_id", "")).replace("cliente", "").replace("cliente", "")
                 email_guess  = _build_email_from_phone(getattr(pedido, "session_id", None), telefono_raw)
                 contact_id = _search_contact(email_guess, _norm_phone_variants(telefono_raw))
             if contact_id:
