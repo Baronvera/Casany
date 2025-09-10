@@ -1,5 +1,5 @@
 # main.py
-APP_BUILD = "build_10"
+APP_BUILD = "build_10_fixed"
 
 import os
 import json
@@ -948,13 +948,20 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
     productos = []
     mensaje = None
 
-    sug = sugerir_productos(texto_usuario, limite=3)
-    if isinstance(sug, dict):
-        productos = (sug.get("productos") or [])[:3]
-        mensaje = sug.get("mensaje")
+    # Sugerencias de productos
+    try:
+        sug = sugerir_productos(texto_usuario, limite=3)
+        if isinstance(sug, dict):
+            productos = (sug.get("productos") or [])[:3]
+            mensaje = sug.get("mensaje")
+    except Exception:
+        productos = []
 
     if not productos:
-        cat, _ = detectar_categoria(texto_usuario)
+        try:
+            cat, _ = detectar_categoria(texto_usuario)
+        except Exception:
+            cat = None
         if cat:
             sug2 = sugerir_productos(cat, limite=3)
             if isinstance(sug2, dict):
@@ -1006,14 +1013,6 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
         f"\nUsuario: {texto_usuario}"
     )
 
-    print("[DBG] texto_usuario:", texto_usuario)
-    prods = extras.get("productos_disponibles") or []
-    print("[DBG] productos_disponibles?:", bool(prods), "n =", len(prods))
-    if prods:
-        print("[DBG] primer producto:", prods[0].get("nombre"), prods[0].get("url"))
-    else:
-        print("[DBG] NO HAY PRODUCTOS DISPONIBLES")
-
     try:
         completion = client.chat.completions.create(
             model="gpt-4o",
@@ -1028,10 +1027,9 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
             response_format={"type": "json_object"}
         )
         raw = completion.choices[0].message.content.strip()
-        print("[DBG] respuesta LLM (raw):", raw)
         data = json.loads(raw)
 
-        # 🔧 Normaliza tallas dentro de acciones cache_list
+        # Normaliza tallas dentro de cache_list
         if isinstance(data, dict):
             acts = data.get("acciones") or []
             norm_acts = []
@@ -1046,25 +1044,17 @@ async def procesar_conversacion_llm(pedido, texto_usuario: str):
             if norm_acts:
                 data["acciones"] = norm_acts
 
-        print("[DBG] json parsed:", data)
         return data
-    except Exception as e:
-        import traceback
-        print("[LLM_ERR]", repr(e))
-        traceback.print_exc()
-        print("RAW LLM:", raw if 'raw' in locals() else "")
-        data = _clean_json(raw if 'raw' in locals() else "{}")
-        raw_campos = data.get("campos", {})
-        if not isinstance(raw_campos, dict):
-            raw_campos = {}
-        _ = {k: v for k, v in raw_campos.items() if k in ALLOWED_CAMPOS}
+    except Exception:
+        # fallback robusto
+        data = {"campos": {}, "respuesta": "¿Quieres ver camisas o jeans?", "acciones": []}
         return data
 
 def _formatear_sugerencias(lista: List[dict]) -> str:
     lines = []
     for i, p in enumerate(lista[:3], start=1):
         precio = _fmt_cop(p.get('precio', 0))
-        lines.append(f"{i}. {p['nombre']} - {precio} - {p['url']}")
+        lines.append(f"{i}. {p.get('nombre','Producto')} - {precio} - {p.get('url','')}")
     return "Aquí tienes algunas opciones:\n" + "\n".join(lines)
 
 # --- Normalizadores y Action Protocol ---
@@ -1167,7 +1157,7 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
         if tallas and not size:
             return {"response": f"Para agregar «{prod.get('nombre','Producto')}» necesito la talla: {', '.join(tallas)}. ¿Cuál prefieres?"}
         # valida que la talla exista
-        if tallas and size and size.upper() not in tallas:
+        if tallas and size and str(size).upper() not in tallas:
             return {"response": f"Para «{prod.get('nombre','Producto')}» tengo {', '.join(tallas)}. ¿Quieres elegir una de esas tallas?"}
 
         carrito = _carrito_load(pedido)
@@ -1176,7 +1166,7 @@ def _handle_action_protocol(payload: dict, db: Session, session_id: str, pedido)
             sku=prod.get("sku") or prod.get("url") or prod.get("nombre","Producto"),
             nombre=prod.get("nombre","Producto"),
             categoria=prod.get("categoria",""),
-            talla=size.upper() if isinstance(size, str) else size,
+            talla=str(size).upper() if isinstance(size, str) else size,
             color=payload.get("color") or prod.get("color"),
             cantidad=int(payload.get("qty") or 1),
             precio_unitario=float(prod.get("precio", 0.0)),
@@ -1218,10 +1208,10 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             "saludo_enviado": 0,
             "last_msg_id": None,
             "sugeridos": "",
-            "ctx_json": "{}",            # ✅ asegurado
-            "ultima_categoria": "",      # ✅ asegurado
-            "ultimos_filtros": "",       # ✅ asegurado
-            "sugeridos_json": "[]",      # ✅ asegurado
+            "ctx_json": "{}",            # asegurado
+            "ultima_categoria": "",      # asegurado
+            "ultimos_filtros": "",       # asegurado
+            "sugeridos_json": "[]",      # asegurado
             "carrito_json": "[]",
             "preferencias_json": "{}",
             "numero_confirmacion": "",
@@ -1231,19 +1221,20 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     last_act_utc = _to_utc(getattr(pedido, "last_activity", None))
     tiempo_inactivo = ahora - last_act_utc
 
-raw_text = user_input.message.strip()
-user_text = raw_text.lower()
+    raw_text = user_input.message.strip()
+    user_text = raw_text.lower()
 
-# Captura nombre si el usuario lo escribió en texto libre (evita pedirlo dos veces)
-name = _detect_nombre(raw_text)
-if name and not getattr(pedido, "nombre_cliente", None):
-    actualizar_pedido_por_sesion(db, session_id, "nombre_cliente", name)
+    # Captura nombre si el usuario lo escribió en texto libre (evita pedirlo dos veces)
+    name = _detect_nombre(raw_text)
+    if name and not getattr(pedido, "nombre_cliente", None):
+        actualizar_pedido_por_sesion(db, session_id, "nombre_cliente", name)
 
-# Captura tienda si el usuario la mencionó y el método es "recoger_en_tienda"
-if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getattr(pedido, "punto_venta", None):
-    pv = _detect_punto_venta(raw_text)
-    if pv:
-        actualizar_pedido_por_sesion(db, session_id, "punto_venta", pv)
+    # Captura tienda si el usuario la mencionó y el método es "recoger_en_tienda"
+    if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getattr(pedido, "punto_venta", None):
+        pv = _detect_punto_venta(raw_text)
+        if pv:
+            actualizar_pedido_por_sesion(db, session_id, "punto_venta", pv)
+
     actualizar_pedido_por_sesion(db, session_id, "last_activity", ahora)
 
     # --------- Detectar filtros del mensaje (con validación de talla) ---------
@@ -1255,7 +1246,7 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
     m_talla_tok = TALLA_TOKEN_RE.search(user_text)
     if m_talla_tok:
         talla_val = (m_talla_tok.group(1) or "").upper()
-        if talla_val in TALLAS_VALIDAS:        # ✅ solo tallas reales
+        if talla_val in TALLAS_VALIDAS:        # solo tallas reales
             filtros_detectados["talla"] = talla_val
 
     m_manga = MANGA_RE.search(user_text)
@@ -1267,15 +1258,14 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
         filtros_detectados["uso"] = m_uso.group(1).lower()
 
     if filtros_detectados:
-        print("[DBG] Guardando filtros:", filtros_detectados)
         set_user_filter(db, session_id, filtros_detectados)
 
-    # ✅ Si llegó talla y hay un producto pendiente (ASK_VARIANT), agréguelo al carrito y limpia pending
+    # Si llegó talla y hay un producto pendiente (ASK_VARIANT), agréguelo al carrito y limpia pending
     if "talla" in filtros_detectados:
         ctx = _ctx_load(pedido)
-        pv = ctx.get("pending_variant")
-        if pv:
-            prod = _resolve_product_ref(db, session_id, pv.get("ref") or pv.get("sku"))
+        pv_ctx = ctx.get("pending_variant")
+        if pv_ctx:
+            prod = _resolve_product_ref(db, session_id, pv_ctx.get("ref") or pv_ctx.get("sku"))
             if prod:
                 tallas = _clean_tallas(prod.get("tallas_disponibles") or [])
                 if tallas and filtros_detectados["talla"] not in tallas:
@@ -1288,7 +1278,7 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
                     categoria=prod.get("categoria",""),
                     talla=filtros_detectados["talla"],
                     color=prod.get("color"),
-                    cantidad=int(pv.get("qty") or 1),
+                    cantidad=int(pv_ctx.get("qty") or 1),
                     precio_unitario=float(prod.get("precio", 0.0)),
                 )
                 _carrito_save(db, session_id, carrito)
@@ -1300,7 +1290,7 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
                 _ctx_save(db, session_id, ctx)
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
-    # ✅ Cantidad pendiente tras seleccionar un producto sin tallas
+    # Cantidad pendiente tras seleccionar un producto sin tallas
     ctx_qty = _ctx_load(pedido)
     awaiting = ctx_qty.get("awaiting_qty")
     if awaiting:
@@ -1330,13 +1320,13 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
         return {"response": "¿Cuántas unidades deseas? (por ejemplo: 1, 2 o 3)"}
 
-    # ✅ Fast-path talla sola
+    # Fast-path talla sola
     m_talla_solo = TALLA_TOKEN_RE.search(user_text)
     if m_talla_solo and not MOSTRAR_RE.search(user_text) and not SELECCION_RE.search(user_text) and not ORDINAL_RE.search(user_text):
         talla_elegida = (m_talla_solo.group(1) or "").upper()
         if talla_elegida in TALLAS_VALIDAS:
-            ctx = _ctx_load(pedido)
-            last = (ctx.get("selecciones") or [])[-1] if ctx.get("selecciones") else None
+            ctx_last = _ctx_load(pedido)
+            last = (ctx_last.get("selecciones") or [])[-1] if ctx_last.get("selecciones") else None
             if last:
                 lista = _get_sugeridos_list(db, session_id)
                 prod = next((p for p in (lista or []) if p.get("url") == last.get("url") or p.get("nombre") == last.get("nombre")), None) or last
@@ -1361,7 +1351,7 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
                     pass
                 return {"response": "Agregado al carrito ✅\n\n" + "\n".join(_cart_summary_lines(carrito))}
 
-    # ✅ Confirmación corta basada en contexto
+    # Confirmación corta basada en contexto
     ctx_tmp = _ctx_load(pedido)
     if ctx_tmp.get("awaiting_confirmation"):
         if re.search(r'^(s[ií]|ok|dale|listo|de acuerdo|est(a|á)\s*bien|as(i|í)\s*est(a|á)\s*bien)\b', user_text, re.I):
@@ -1403,12 +1393,12 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
                 )
             }
 
-    # ✅ Manejo de pago/confirmación (router híbrido)
+    # Manejo de pago/confirmación (router híbrido)
     resp_pago = await procesar_mensaje_usuario(user_text, db, session_id, pedido)
     if resp_pago:
         return resp_pago
 
-    # ✅ Reinicio por inactividad
+    # Reinicio por inactividad
     if tiempo_inactivo.total_seconds() / 60 > TIMEOUT_MIN:
         db.query(Pedido).filter(Pedido.session_id == session_id).delete()
         db.commit()
@@ -1450,6 +1440,7 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
         telefono_cliente = session_id.replace("cliente_", "")
         actualizar_pedido_por_sesion(db, session_id, "telefono", telefono_cliente)
 
+    # Si el pedido está cancelado, maneja reinicio
     if pedido and pedido.estado == "cancelado":
         if SALUDO_RE.match(user_text):
             db.query(Pedido).filter(Pedido.session_id == session_id).delete()
@@ -1473,10 +1464,10 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
                 "saludo_enviado": 0,
                 "last_msg_id": None,
                 "sugeridos": "",
-                "ctx_json": "{}",            # ✅
-                "ultima_categoria": "",      # ✅
-                "ultimos_filtros": "",       # ✅
-                "sugeridos_json": "[]",      # ✅
+                "ctx_json": "{}",            # reset
+                "ultima_categoria": "",      # reset
+                "ultimos_filtros": "",       # reset
+                "sugeridos_json": "[]",      # reset
                 "carrito_json": "[]",
                 "preferencias_json": "{}",
                 "numero_confirmacion": "",
@@ -1484,11 +1475,13 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
             return {"response": SALUDO_BASE}
         return {"response": "No tienes ningún pedido activo en este momento. Escribe ‘hola’ cuando quieras comenzar una nueva compra."}
 
+    # Derivar a atención humana
     if detectar_intencion_atencion(user_text):
         mensaje_alerta = generar_mensaje_atencion_humana(pedido)
         await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, mensaje_alerta)
         return {"response": "Entendido, ya te pongo en contacto con uno de nuestros asesores. Te responderán personalmente en breve para ayudarte con lo que necesitas."}
 
+    # Cancelación explícita
     if any(neg in user_text for neg in ["ya no quiero", "cancelar pedido", "no deseo", "me arrepentí", "me arrepenti"]):
         producto_cancelado = pedido.producto or "el pedido actual"
         actualizar_pedido_por_sesion(db, session_id, "estado", "cancelado")
@@ -1499,21 +1492,22 @@ if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getatt
         actualizar_pedido_por_sesion(db, session_id, "punto_venta", "")
         return {"response": f"Entiendo, he cancelado {producto_cancelado}. ¿Te gustaría ver otra prenda o necesitas ayuda con algo más?"}
 
-if SALUDO_RE.match(user_text):
-    if _get_saludo_enviado(db, session_id) == 0:
-        actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
-        return {"response": SALUDO_BASE}
-    # Si hay flujo activo, no resetees
-    carrito = _carrito_load(pedido)
-    if carrito or getattr(pedido, "metodo_entrega", "") or getattr(pedido, "producto", ""):
-        lineas = _cart_summary_lines(carrito)
-        faltan = _pedido_missing_fields(pedido)
-        pregunta = _prompt_for_missing(pedido, faltan) if faltan else "¿Confirmo tu pedido?"
-        return {"response": "\n".join(lineas) + ("\n\n" + pregunta if pregunta else "")}
-    # Si no hay flujo, saludo estándar
-    return {"response": "¡Hola! ¿Qué te gustaría ver hoy: camisas, jeans, pantalones o suéteres?"}
+    # Saludo
+    if SALUDO_RE.match(user_text):
+        if _get_saludo_enviado(db, session_id) == 0:
+            actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
+            return {"response": SALUDO_BASE}
+        # Si hay flujo activo, no resetees
+        carrito = _carrito_load(pedido)
+        if carrito or getattr(pedido, "metodo_entrega", "") or getattr(pedido, "producto", ""):
+            lineas = _cart_summary_lines(carrito)
+            faltan = _pedido_missing_fields(pedido)
+            pregunta = _prompt_for_missing(pedido, faltan) if faltan else "¿Confirmo tu pedido?"
+            return {"response": "\n".join(lineas) + ("\n\n" + pregunta if pregunta else "")}
+        # Si no hay flujo, saludo estándar
+        return {"response": "¡Hola! ¿Qué te gustaría ver hoy: camisas, jeans, pantalones o suéteres?"}
 
-
+    # Entrega: domicilio / recoger
     if DOMICILIO_RE.search(user_text):
         actualizar_pedido_por_sesion(db, session_id, "metodo_entrega", "domicilio")
         if not getattr(pedido, "datos_personales_advertidos", False):
@@ -1533,21 +1527,23 @@ if SALUDO_RE.match(user_text):
         tiendas = "\n".join(PUNTOS_VENTA)
         return {"response": f"Por favor, confirma en cuál de nuestras tiendas deseas recoger tu pedido:\n{tiendas}"}
 
-if SMALLTALK_RE.search(user_text):
-    carrito = _carrito_load(pedido)
-    if carrito or getattr(pedido, "metodo_entrega", "") or getattr(pedido, "producto", ""):
-        lineas = _cart_summary_lines(carrito)
-        faltan = _pedido_missing_fields(pedido)
-        pregunta = _prompt_for_missing(pedido, faltan) if faltan else "¿Deseas confirmar el pedido?"
-        return {"response": "\n".join(lineas) + ("\n\n" + pregunta if pregunta else "")}
-    cats = ", ".join(CATEGORIAS_RESUMEN[:4]) + "…"
-    return {"response": f"¡Con gusto! ¿Te muestro algo hoy? Tenemos {cats} ¿Qué prefieres ver primero?"}
+    # Smalltalk
+    if SMALLTALK_RE.search(user_text):
+        carrito = _carrito_load(pedido)
+        if carrito or getattr(pedido, "metodo_entrega", "") or getattr(pedido, "producto", ""):
+            lineas = _cart_summary_lines(carrito)
+            faltan = _pedido_missing_fields(pedido)
+            pregunta = _prompt_for_missing(pedido, faltan) if faltan else "¿Deseas confirmar el pedido?"
+            return {"response": "\n".join(lineas) + ("\n\n" + pregunta if pregunta else "")}
+        cats = ", ".join(CATEGORIAS_RESUMEN[:4]) + "…"
+        return {"response": f"¡Con gusto! ¿Te muestro algo hoy? Tenemos {cats} ¿Qué prefieres ver primero?"}
 
-
+    # Offtopic
     if OFFTOPIC_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
         return {"response": "Somos CASSANY, una marca de ropa para hombre. Trabajamos estas categorías:\n" + f"{cats}\n\n" + "¿Te muestro camisas o prefieres otra categoría?"}
 
+    # Discovery
     if DISCOVERY_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
         return {
@@ -1561,23 +1557,23 @@ if SMALLTALK_RE.search(user_text):
             )
         }
 
+    # Ver carrito
     if CARRO_RE.search(user_text):
         carrito = _carrito_load(pedido)
         lineas = _cart_summary_lines(carrito)
         return {"response": "\n".join(lineas)}
 
+    # Petición de fotos de algo
     m_fotos = FOTOS_RE.search(user_text)
     if m_fotos:
-        if _tiene_atributos_especificos(user_text):
-            pass
-        else:
+        if not _tiene_atributos_especificos(user_text):
             cat_txt = m_fotos.group(2).strip()
             cat, _ = detectar_categoria(cat_txt)
             consulta = cat or cat_txt
 
             urls_previas = _get_sugeridos_urls(db, session_id)
             res = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-            productos = res.get("productos", [])
+            productos = res.get("productos", []) if isinstance(res, dict) else []
 
             if productos:
                 filtros = detectar_atributos(cat_txt) or {}
@@ -1591,17 +1587,16 @@ if SMALLTALK_RE.search(user_text):
             cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
             return {"response": f"No hay stock para «{cat_txt}» en este momento. ¿Te muestro algo de:\n{cats}"}
 
+    # “Muéstrame …”
     if MOSTRAR_RE.search(user_text):
-        if _tiene_atributos_especificos(user_text):
-            pass
-        else:
+        if not _tiene_atributos_especificos(user_text):
             ultima_cat, _ = _get_ultima_cat_filters(db, session_id)
             cat, _ = detectar_categoria(user_text)
             consulta = cat or ultima_cat
             if consulta:
                 urls_previas = _get_sugeridos_urls(db, session_id)
                 res = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-                productos = res.get("productos", [])
+                productos = res.get("productos", []) if isinstance(res, dict) else []
                 if productos:
                     for p in productos:
                         if isinstance(p, dict) and "tallas_disponibles" in p:
@@ -1612,6 +1607,7 @@ if SMALLTALK_RE.search(user_text):
             cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
             return {"response": f"¿Qué te muestro primero?\n{cats}"}
 
+    # Más opciones
     if MAS_OPCIONES_RE.search(user_text):
         productos_previos = _get_sugeridos_list(db, session_id)
         if productos_previos:
@@ -1643,11 +1639,11 @@ if SMALLTALK_RE.search(user_text):
             urls_previas = _get_sugeridos_urls(db, session_id)
 
             res = sugerir_productos(consulta, limite=3, excluir_urls=urls_previas)
-            productos = res.get("productos", [])
+            productos = res.get("productos", []) if isinstance(res, dict) else []
 
             if not productos:
                 res2 = sugerir_productos(ultima_cat, limite=3, excluir_urls=urls_previas)
-                productos = res2.get("productos", [])
+                productos = res2.get("productos", []) if isinstance(res2, dict) else []
 
             if productos:
                 for p in productos:
@@ -1665,7 +1661,7 @@ if SMALLTALK_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
         return {"response": f"No detecté ninguna categoría concreta en tu solicitud. ¿Te gustaría que te muestre opciones de:\n{cats}"}
 
-    # ✅ Selección por ordinal (“la primera / segunda / tercera”)
+    # Selección por ordinal (“la primera / segunda / ...”)
     m_ord = ORDINAL_RE.search(user_text)
     if m_ord:
         idx0 = ORDINALES_MAP[m_ord.group(1).lower()] - 1
@@ -1717,7 +1713,7 @@ if SMALLTALK_RE.search(user_text):
         if num_txt:
             idx = int(num_txt) - 1
             lista = _get_sugeridos_list(db, session_id)
-            if 0 <= idx < len(lista):
+            if lista and 0 <= idx < len(lista):
                 prod = lista[idx]
                 actualizar_pedido_por_sesion(db, session_id, "producto", prod.get("nombre", ""))
                 actualizar_pedido_por_sesion(db, session_id, "precio_unitario", prod.get("precio", 0.0))
@@ -1764,17 +1760,18 @@ if SMALLTALK_RE.search(user_text):
             if lista:
                 return {"response": f"Por favor indícame un número entre 1 y {len(lista)} de la lista que te mostré."}
 
+    # Rechazo / “otras opciones”
     if any(pat in user_text for pat in PATRONES_RECHAZO):
         urls_previas = _get_sugeridos_urls(db, session_id)
         res = sugerir_productos(user_text, limite=3, excluir_urls=urls_previas)
-        productos = res.get("productos", [])
+        productos = res.get("productos", []) if isinstance(res, dict) else []
 
         if len(productos) < 3:
             cat_relajada, _ = detectar_categoria(user_text)
             if cat_relajada:
                 res2 = sugerir_productos(cat_relajada, limite=3, excluir_urls=urls_previas)
-                ya = {p["url"] for p in productos}
-                productos += [p for p in res2.get("productos", []) if p["url"] not in ya]
+                ya = {p["url"] for p in productos if isinstance(p, dict) and p.get("url")}
+                productos += [p for p in (res2.get("productos", []) if isinstance(res2, dict) else []) if p.get("url") not in ya]
 
         if productos:
             try:
@@ -1792,10 +1789,11 @@ if SMALLTALK_RE.search(user_text):
             _append_sugeridos_urls(db, session_id, [p["url"] for p in productos if p.get("url")])
             return {"response": _formatear_sugerencias(productos)}
         else:
-            msg = res.get("mensaje") or "No encontré opciones que cumplan lo que pides. ¿Te muestro algo similar?"
+            msg = res.get("mensaje") if isinstance(res, dict) else None
+            msg = msg or "No encontré opciones que cumplan lo que pides. ¿Te muestro algo similar?"
             return {"response": msg}
 
-    # ======= LLM =======
+    # ======= LLM (flujo general) =======
     resultado = await procesar_conversacion_llm(pedido, user_text)
 
     # a) Soporte del Protocolo de Acciones (ADD_TO_CART / SHOW_CART / etc.)
@@ -1828,13 +1826,12 @@ if SMALLTALK_RE.search(user_text):
             if filtros.get("uso"):
                 partes.append(filtros["uso"])
 
-            consulta = " ".join(partes).strip()
+            consulta = " ".join(partes).strip() or (user_text or "")
             urls_previas = _get_sugeridos_urls(db, session_id)
-            res_fallback = sugerir_productos(consulta or user_text, limite=12, excluir_urls=urls_previas)
-            productos = res_fallback.get("productos", [])
+            res_fallback = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
+            productos = res_fallback.get("productos", []) if isinstance(res_fallback, dict) else []
 
             if productos:
-                print("[DBG] Fallback: forzando guardado de productos (no hubo cache_list)")
                 for p in productos:
                     if isinstance(p, dict) and "tallas_disponibles" in p:
                         p["tallas_disponibles"] = _clean_tallas(p.get("tallas_disponibles"))
@@ -1843,6 +1840,7 @@ if SMALLTALK_RE.search(user_text):
                 resultado["respuesta"] = _formatear_sugerencias(productos[:3]) + \
                     "\n¿Te muestro más opciones o agrego alguna al carrito?"
 
+    # Ejecuta acciones del LLM sobre carrito / prefs
     acciones = resultado.get("acciones") or []
     if isinstance(acciones, list) and acciones:
         carrito = _carrito_load(pedido)
@@ -1903,6 +1901,7 @@ if SMALLTALK_RE.search(user_text):
                                 db, session_id,
                                 [p.get("url") for p in productos if isinstance(p, dict) and p.get("url")]
                             )
+                            # Si el modelo envió <=3, ampliamos
                             if len(productos) <= 3:
                                 ultima_cat, ult_filtros = _get_ultima_cat_filters(db, session_id)
                                 if not ultima_cat:
@@ -1924,7 +1923,7 @@ if SMALLTALK_RE.search(user_text):
                                 consulta = " ".join([p for p in partes if p]).strip() or (user_text or "")
                                 urls_previas = _get_sugeridos_urls(db, session_id)
                                 res_plus = sugerir_productos(consulta, limite=12, excluir_urls=urls_previas)
-                                extra = res_plus.get("productos", [])
+                                extra = res_plus.get("productos", []) if isinstance(res_plus, dict) else []
                                 if extra:
                                     for p in extra:
                                         if isinstance(p, dict) and "tallas_disponibles" in p:
@@ -1936,7 +1935,6 @@ if SMALLTALK_RE.search(user_text):
                                         db, session_id,
                                         [p.get("url") for p in extra if isinstance(p, dict) and p.get("url")]
                                     )
-                                    print(f"[DBG] cache_list top-up: {len(productos)} -> {len(merged)} items")
                         except Exception:
                             pass
             except Exception:
@@ -1974,7 +1972,7 @@ if SMALLTALK_RE.search(user_text):
         tiendas = "\n".join(PUNTOS_VENTA)
         return {"response": f"Por favor, confirma en cuál de nuestras tiendas deseas recoger tu pedido:\n{tiendas}"}
 
-    # Dirección + ciudad completos: NO llamar HubSpot aquí para evitar duplicados
+    # Dirección + ciudad completos
     if campos_dict.get("direccion") and campos_dict.get("ciudad"):
         return {
             "response": (
@@ -2022,8 +2020,6 @@ if SMALLTALK_RE.search(user_text):
 
     return {"response": resultado.get("respuesta", "Disculpa, ocurrió un error.")}
 
-
-
 # ------------------ Health / Webhook ------------------
 @app.get("/")
 def root():
@@ -2050,7 +2046,7 @@ def _verify_wa_signature(raw_body: bytes, signature_256: str) -> bool:
     try:
         mac = hmac.new(WA_APP_SECRET.encode("utf-8"), msg=raw_body, digestmod=hashlib.sha256)
         expected = "sha256=" + mac.hexdigest()
-        # tiempo-constante
+        # comparación en tiempo-constante
         return hmac.compare_digest(expected, signature_256)
     except Exception:
         return False
@@ -2105,7 +2101,7 @@ async def receive_whatsapp_message(
                     res = await mensaje_whatsapp(UserMessage(message=txt), session_id=session_id, db=db)
                     # marca como procesado ANTES de enviar para evitar reprocesos en reintentos
                     actualizar_pedido_por_sesion(db, session_id, "last_msg_id", msg_id)
-                    await enviar_mensaje_whatsapp(num, res["response"])
+                    await enviar_mensaje_whatsapp(num, res.get("response", ""))
                 finally:
                     db.close()
     return {"status": "received"}
@@ -2135,11 +2131,5 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
-
-
-
-
-
-
 
 
