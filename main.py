@@ -175,6 +175,8 @@ FOTOS_RE   = re.compile(r'\b(fotos?|im[aá]genes?)\s+de\s+([a-záéíóúñü\s]
 
 # Tallas
 TALLA_RE = re.compile(r'\btalla\b|\b(XXL|XL|XS|S|M|L)\b', re.I)  # para detectar la palabra
+
+NOMBRE_RE = re.compile( r'(?:me llamo|mi nombre es)\s*([a-záéíóúñü]+(?:\s+[a-záéíóúñü]+){1,3})', re.I)
 TALLA_TOKEN_RE = re.compile(r'\b(XXL|XL|XS|S|M|L|28|30|32|34|36|38|40|42)\b', re.I)  # para extraer valor real
 USO_RE = re.compile(r'\b(oficina|formal|casual|evento|trabajo)\b', re.I)
 MANGA_RE = re.compile(r'\bmanga\s+(corta|larga)\b', re.I)
@@ -182,6 +184,21 @@ COLOR_RE = re.compile(
     r'\b(blanco|blanca|negro|negra|azul|azules|beige|gris|rojo|verde|café|marr[oó]n|vinotinto|mostaza|'
     r'crema|turquesa|celeste|lila|morado|rosa|rosado|amarillo|naranja)\b', re.I
 )
+
+PUNTO_VENTA_ALIAS = {
+    "unicentro": "C.C Unicentro",
+    "mayorca": "C.C Mayorca",
+    "premium plaza": "C.C Premium Plaza",
+    "premium": "C.C Premium Plaza",
+    "la central": "C.C La Central",
+    "central": "C.C La Central",
+    "florida": "C.C Florida",
+    "fabricato": "C.C Fabricato",
+    "junin": "Centro - Junín",
+    "junín": "Centro - Junín",
+    "centro colombia": "Centro - Colombia",
+    "colombia": "Centro - Colombia",
+}
 
 # Ordinales (la primera/segunda/...)
 ORDINALES_MAP = {
@@ -400,6 +417,21 @@ TALLAS_VALIDAS = {
     "XS", "S", "M", "L", "XL", "XXL",
     "28", "30", "32", "34", "36", "38", "40", "42"
 }
+
+def _detect_nombre(txt: str) -> Optional[str]:
+    m = NOMBRE_RE.search(txt or "")
+    if m:
+        nom = " ".join(w.capitalize() for w in m.group(1).split())
+        return nom
+    return None
+
+def _detect_punto_venta(txt: str) -> Optional[str]:
+    t = _norm_txt(txt or "")
+    for key, canon in PUNTO_VENTA_ALIAS.items():
+        if key in t:
+            return canon
+    return None
+
 def _clean_tallas(arr):
     if not isinstance(arr, list):
         return []
@@ -701,6 +733,10 @@ def _prefs_save(db: Session, session_id: str, prefs: dict):
         db.commit()
     except Exception:
         db.rollback()
+
+def _item_exists(carrito: list, sku: str, talla: str = None, color: str = None) -> bool:
+    return any(i for i in carrito
+               if i["sku"] == sku and i.get("talla") == talla and i.get("color") == color)
 
 def _cart_add(carrito: list, sku: str, nombre: str, categoria: str,
               talla: str = None, color: str = None, cantidad: int = 1,
@@ -1195,7 +1231,19 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     last_act_utc = _to_utc(getattr(pedido, "last_activity", None))
     tiempo_inactivo = ahora - last_act_utc
 
-    user_text = user_input.message.strip().lower()
+   raw_text = user_input.message.strip()
+user_text = raw_text.lower()
+
+# Captura nombre si el usuario lo escribió en texto libre (evita pedirlo dos veces)
+name = _detect_nombre(raw_text)
+if name and not getattr(pedido, "nombre_cliente", None):
+    actualizar_pedido_por_sesion(db, session_id, "nombre_cliente", name)
+
+# Captura tienda si el usuario la mencionó y el método es "recoger_en_tienda"
+if (getattr(pedido, "metodo_entrega", "") == "recoger_en_tienda") and not getattr(pedido, "punto_venta", None):
+    pv = _detect_punto_venta(raw_text)
+    if pv:
+        actualizar_pedido_por_sesion(db, session_id, "punto_venta", pv)
     actualizar_pedido_por_sesion(db, session_id, "last_activity", ahora)
 
     # --------- Detectar filtros del mensaje (con validación de talla) ---------
@@ -1451,11 +1499,20 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         actualizar_pedido_por_sesion(db, session_id, "punto_venta", "")
         return {"response": f"Entiendo, he cancelado {producto_cancelado}. ¿Te gustaría ver otra prenda o necesitas ayuda con algo más?"}
 
-    if SALUDO_RE.match(user_text):
-        if _get_saludo_enviado(db, session_id) == 0:
-            actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
-            return {"response": SALUDO_BASE}
-        return {"response": "¡Hola! ¿Qué te gustaría ver hoy: camisas, jeans, pantalones o suéteres?"}
+if SALUDO_RE.match(user_text):
+    if _get_saludo_enviado(db, session_id) == 0:
+        actualizar_pedido_por_sesion(db, session_id, "saludo_enviado", 1)
+        return {"response": SALUDO_BASE}
+    # Si hay flujo activo, no resetees
+    carrito = _carrito_load(pedido)
+    if carrito or getattr(pedido, "metodo_entrega", "") or getattr(pedido, "producto", ""):
+        lineas = _cart_summary_lines(carrito)
+        faltan = _pedido_missing_fields(pedido)
+        pregunta = _prompt_for_missing(pedido, faltan) if faltan else "¿Confirmo tu pedido?"
+        return {"response": "\n".join(lineas) + ("\n\n" + pregunta if pregunta else "")}
+    # Si no hay flujo, saludo estándar
+    return {"response": "¡Hola! ¿Qué te gustaría ver hoy: camisas, jeans, pantalones o suéteres?"}
+
 
     if DOMICILIO_RE.search(user_text):
         actualizar_pedido_por_sesion(db, session_id, "metodo_entrega", "domicilio")
@@ -1476,9 +1533,16 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         tiendas = "\n".join(PUNTOS_VENTA)
         return {"response": f"Por favor, confirma en cuál de nuestras tiendas deseas recoger tu pedido:\n{tiendas}"}
 
-    if SMALLTALK_RE.search(user_text):
-        cats = ", ".join(CATEGORIAS_RESUMEN[:4]) + "…"
-        return {"response": f"¡Con gusto! ¿Te muestro algo hoy? Tenemos {cats} ¿Qué prefieres ver primero?"}
+if SMALLTALK_RE.search(user_text):
+    carrito = _carrito_load(pedido)
+    if carrito or getattr(pedido, "metodo_entrega", "") or getattr(pedido, "producto", ""):
+        lineas = _cart_summary_lines(carrito)
+        faltan = _pedido_missing_fields(pedido)
+        pregunta = _prompt_for_missing(pedido, faltan) if faltan else "¿Deseas confirmar el pedido?"
+        return {"response": "\n".join(lineas) + ("\n\n" + pregunta if pregunta else "")}
+    cats = ", ".join(CATEGORIAS_RESUMEN[:4]) + "…"
+    return {"response": f"¡Con gusto! ¿Te muestro algo hoy? Tenemos {cats} ¿Qué prefieres ver primero?"}
+
 
     if OFFTOPIC_RE.search(user_text):
         cats = "\n- " + "\n- ".join(CATEGORIAS_RESUMEN)
@@ -2071,6 +2135,7 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
 
