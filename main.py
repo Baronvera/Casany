@@ -1231,7 +1231,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
     last_act_utc = _to_utc(getattr(pedido, "last_activity", None))
     tiempo_inactivo = ahora - last_act_utc
 
-   raw_text = user_input.message.strip()
+raw_text = user_input.message.strip()
 user_text = raw_text.lower()
 
 # Captura nombre si el usuario lo escribió en texto libre (evita pedirlo dos veces)
@@ -2135,6 +2135,7 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
 
