@@ -1910,17 +1910,18 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         tiendas = "\n".join(PUNTOS_VENTA)
         return {"response": f"Por favor, confirma en cuál de nuestras tiendas deseas recoger tu pedido:\n{tiendas}"}
 
-    if campos_dict.get("metodo_entrega") == "domicilio":
-        if not getattr(pedido, "datos_personales_advertidos", False):
-            actualizar_pedido_por_sesion(db, session_id, "datos_personales_advertidos", True)
-            return {
-                "response": (
-                    "Antes de continuar, ten en cuenta que tus datos personales serán tratados "
-                    "bajo nuestra política de tratamiento de datos, que puedes consultar aquí:\n"
-                    "https://cassany.co/tratamiento-de-datos-personales/\n\n"
-                    "Ahora, ¿podrías proporcionarme tu dirección y ciudad para el envío?"
-                )
-            }
+    if campos_dict.get("direccion") and campos_dict.get("ciudad"):
+        # Ya no enviamos a HubSpot aquí para evitar duplicados de Deal.
+        return {
+            "response": (
+                "Perfecto, he registrado tu dirección y ciudad.\n\n"
+                "Por favor, confirma el método de pago que prefieres:\n"
+                f"- Transferencia a Bancolombia: Cuenta Corriente No. {CTA_BANCOLOMBIA}\n"
+                f"- Transferencia a Davivienda: Cuenta Corriente No. {CTA_DAVIVIENDA}\n"
+                "- Pago con PayU desde nuestro sitio web."
+            )
+        }
+
         return {"response": "Perfecto, por favor indícame tu dirección y ciudad para el envío."}
 
    if campos_dict.get("direccion") and campos_dict.get("ciudad"):
@@ -2082,6 +2083,7 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
 
