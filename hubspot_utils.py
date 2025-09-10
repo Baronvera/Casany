@@ -1,4 +1,4 @@
-# hubspot_utils.py — v3.0 (Contacts upsert + Task creation/association)
+# hubspot_utils.py — v4.0 (Contacts upsert + DEAL creation/association + Task opcional SLA)
 import os
 import re
 import time
@@ -13,15 +13,27 @@ load_dotenv()
 # ========= Config =========
 HUBSPOT_TOKEN = os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip()  # Private App Token
 HS_DEFAULT_OWNER_ID = os.getenv("HS_DEFAULT_OWNER_ID", "").strip()          # opcional
-HS_DESPACHOS_QUEUE_ID = os.getenv("HS_DESPACHOS_QUEUE_ID", "").strip()      # opcional
+
+# IDs REALES requeridos (no uses "default" a menos que sea el ID real en tu portal)
+HS_DEAL_PIPELINE_ID = os.getenv("HS_DEAL_PIPELINE_ID", "").strip()          # p.ej. "default" si ESE es el ID real
+HS_DEAL_STAGE_ID = os.getenv("HS_DEAL_STAGE_ID", "").strip()                # p.ej. "appointmentscheduled" o personalizado
+
+# Feature flag: crear además una Task operativa (SLA +2h) al crear el Deal
+HS_CREATE_SLA_TASK = (os.getenv("HS_CREATE_SLA_TASK", "true").strip().lower() == "true")
 
 # Endpoints
 BASE_CONTACTS = "https://api.hubapi.com/crm/v3/objects/contacts"
 SEARCH_CONTACTS = "https://api.hubapi.com/crm/v3/objects/contacts/search"
+
+BASE_DEALS = "https://api.hubapi.com/crm/v3/objects/deals"
+SEARCH_DEALS = "https://api.hubapi.com/crm/v3/objects/deals/search"
+PROP_DEALS = "https://api.hubapi.com/crm/v3/properties/deals"
+PROP_DEALS_ONE = "https://api.hubapi.com/crm/v3/properties/deals/{prop}"
+
+# Para la Task opcional
 BASE_TASKS = "https://api.hubapi.com/crm/v3/objects/tasks"
-SEARCH_TASKS = "https://api.hubapi.com/crm/v3/objects/tasks/search"
-PROP_TASKS = "https://api.hubapi.com/crm/v3/properties/tasks"
-PROP_TASKS_ONE = "https://api.hubapi.com/crm/v3/properties/tasks/{prop}"
+
+# Associations v4
 ASSOC_LABELS = "https://api.hubapi.com/crm/v4/associations/{from_obj}/{to_obj}/labels"
 ASSOC_OBJECTS = "https://api.hubapi.com/crm/v4/objects/{from_obj}/{from_id}/associations/{to_obj}/{to_id}"
 
@@ -133,7 +145,6 @@ def _build_search_body(email: str, phone_variants: Tuple[str, str]) -> Dict[str,
         if value:
             groups.append({"filters": [{"propertyName": prop, "operator": "EQ", "value": value}]})
 
-    # Variantes de phone
     _add_phone_group("phone", plain57)
     _add_phone_group("phone", plus57)
     _add_phone_group("mobilephone", plain57)
@@ -175,6 +186,7 @@ def _search_contact(email: str, phone_variants: Tuple[str, str]) -> Optional[str
 def _prepare_contact_properties(pedido) -> Dict[str, Any]:
     """
     Mapea el pedido a propiedades de HubSpot (Contacto).
+    Mantiene contacto "limpio"; los datos transaccionales van al Deal.
     """
     telefono_raw = getattr(pedido, "telefono", None) or _safe(getattr(pedido, "session_id", "")).replace("cliente_", "")
     plain57, plus57 = _norm_phone_variants(telefono_raw)
@@ -184,14 +196,6 @@ def _prepare_contact_properties(pedido) -> Dict[str, Any]:
     nombre   = _safe(getattr(pedido, "nombre_cliente", None)) or "Cliente"
     direccion= _safe(getattr(pedido, "direccion", None))
     ciudad   = _safe(getattr(pedido, "ciudad", None))
-    producto = _safe(getattr(pedido, "producto", None))
-    talla    = _safe(getattr(pedido, "talla", None))
-    cantidad = str(getattr(pedido, "cantidad", 0) or 0)
-    metodo_pago = _safe(getattr(pedido, "metodo_pago", None))
-    metodo_entrega = _safe(getattr(pedido, "metodo_entrega", None)).lower()
-    numero_confirmacion = _safe(getattr(pedido, "numero_confirmacion", None))
-    estado   = _safe(getattr(pedido, "estado", "pendiente"))
-    punto_venta = _safe(getattr(pedido, "punto_venta", None))
 
     props: Dict[str, Any] = {
         "email": email,
@@ -200,18 +204,7 @@ def _prepare_contact_properties(pedido) -> Dict[str, Any]:
         "mobilephone": plus57 or plain57,
         "address": direccion,
         "city": ciudad,
-        # Si estás usando estas custom en Contacto, se mantienen:
-        "custom_cas_producto": producto,
-        "custom_cas_talla": talla,
-        "custom_cas_cantidad": cantidad,
-        "custom_cas_metodo_pago": metodo_pago,
-        "custom_cas_metodo_entrega": metodo_entrega,
-        "custom_cas_numero_confirmacion": numero_confirmacion,
-        "custom_cas_estado": estado,
     }
-    if metodo_entrega == "recoger_en_tienda" and punto_venta:
-        props["custom_cas_punto_de_venta"] = punto_venta
-
     cleaned = {k: v for k, v in props.items() if v not in (None, "", " ")}
     return cleaned
 
@@ -254,18 +247,18 @@ def _upsert_contact_and_get_id(pedido) -> Optional[str]:
         print("❌ HubSpot error inesperado (contact upsert):", repr(e))
     return None
 
-# ---------- Helpers Tasks ----------
+# ---------- Helpers Deals ----------
 
-def _ensure_task_property_order_id():
+def _ensure_deal_property_order_id():
     """
-    Garantiza que exista la propiedad custom `order_id` en Tasks (texto).
+    Garantiza que exista la propiedad custom `order_id` en Deals (texto).
     """
-    cache_key = "tasks.order_id"
+    cache_key = "deals.order_id"
     if cache_key in _PROP_CREATED_CACHE:
         return
     # ¿Existe?
     try:
-        url = PROP_TASKS_ONE.format(prop="order_id")
+        url = PROP_DEALS_ONE.format(prop="order_id")
         r = _request_with_retry("GET", url, timeout=10)
         if 200 <= r.status_code < 300:
             _PROP_CREATED_CACHE.add(cache_key)
@@ -280,26 +273,26 @@ def _ensure_task_property_order_id():
         "type": "string",
         "fieldType": "text",
         "description": "Identificador único del pedido (para idempotencia)",
-        "groupName": "taskinformation"
+        "groupName": "dealinformation"
     }
     try:
-        _request_with_retry("POST", PROP_TASKS, json_payload=body, timeout=10)
+        _request_with_retry("POST", PROP_DEALS, json_payload=body, timeout=10)
     except Exception:
         # Si otro proceso la creó en carrera, ignoramos
         pass
     _PROP_CREATED_CACHE.add(cache_key)
 
-def _find_task_by_order_id(order_id: str) -> Optional[str]:
+def _find_deal_by_order_id(order_id: str) -> Optional[str]:
     if not order_id:
         return None
-    _ensure_task_property_order_id()
+    _ensure_deal_property_order_id()
     body = {
         "filterGroups": [{"filters": [{"propertyName": "order_id", "operator": "EQ", "value": str(order_id)}]}],
-        "properties": ["hs_task_subject", "order_id"],
+        "properties": ["dealname", "order_id", "amount"],
         "limit": 1
     }
     try:
-        r = _request_with_retry("POST", SEARCH_TASKS, json_payload=body, timeout=10)
+        r = _request_with_retry("POST", SEARCH_DEALS, json_payload=body, timeout=10)
         r.raise_for_status()
         results = (r.json() or {}).get("results", [])
         if results:
@@ -307,14 +300,34 @@ def _find_task_by_order_id(order_id: str) -> Optional[str]:
     except Exception as e:
         try:
             if isinstance(e, requests.HTTPError) and e.response is not None:
-                print("❌ HubSpot search task error:", e, e.response.status_code, e.response.text)
+                print("❌ HubSpot search deal error:", e, e.response.status_code, e.response.text)
             else:
-                print("❌ HubSpot search task error:", repr(e))
+                print("❌ HubSpot search deal error:", repr(e))
         except Exception:
-            print("❌ HubSpot search task error:", repr(e))
+            print("❌ HubSpot search deal error:", repr(e))
     return None
 
+def _create_deal(props: Dict[str, Any]) -> Optional[str]:
+    try:
+        r = _request_with_retry("POST", BASE_DEALS, json_payload={"properties": props}, timeout=10)
+        r.raise_for_status()
+        return (r.json() or {}).get("id")
+    except Exception as e:
+        try:
+            if isinstance(e, requests.HTTPError) and e.response is not None:
+                print("❌ HubSpot create deal error:", e, e.response.status_code, e.response.text)
+            else:
+                print("❌ HubSpot create deal error:", repr(e))
+        except Exception:
+            print("❌ HubSpot create deal error:", repr(e))
+    return None
+
+# ---------- Helpers Tasks (opcional SLA) ----------
+
 def _create_task(props: Dict[str, Any]) -> Optional[str]:
+    """
+    Crea una Task simple (se usa SOLO si HS_CREATE_SLA_TASK=true).
+    """
     try:
         r = _request_with_retry("POST", BASE_TASKS, json_payload={"properties": props}, timeout=10)
         r.raise_for_status()
@@ -329,9 +342,11 @@ def _create_task(props: Dict[str, Any]) -> Optional[str]:
             print("❌ HubSpot create task error:", repr(e))
     return None
 
+# ---------- Associations ----------
+
 def _get_assoc_type_id(from_obj: str, to_obj: str) -> int:
     """
-    Obtiene y cachea el associationTypeId por defecto entre dos objetos (p.ej., tasks -> contacts).
+    Obtiene y cachea el associationTypeId por defecto entre dos objetos (p.ej., deals -> contacts).
     """
     key = f"{from_obj}->{to_obj}"
     if key in _ASSOC_TYPE_CACHE:
@@ -368,7 +383,7 @@ def _associate_objects(from_obj: str, from_id: str, to_obj: str, to_id: str):
         except Exception:
             print("❌ HubSpot association error:", repr(e))
 
-# ---------- Helpers de Tarea (contenido) ----------
+# ---------- Helpers de Deal (contenido) ----------
 
 def _fmt_money_cop(v) -> str:
     try:
@@ -387,86 +402,128 @@ def _build_order_id(pedido) -> str:
     basis = sid or f"anon-{int(time.time())}"
     return "SID-" + hashlib.md5(basis.encode("utf-8")).hexdigest()[:10]
 
-def _compose_task_subject(pedido) -> str:
+def _compose_deal_name(pedido) -> str:
     nombre = _safe(getattr(pedido, "nombre_cliente", None))
-    return f"Despachar pedido {_build_order_id(pedido)} — {nombre or 'Cliente WhatsApp'}"
+    return f"Pedido {_build_order_id(pedido)} — {nombre or 'Cliente WhatsApp'}"
 
-def _compose_task_body(pedido, cart_items: List[dict]) -> str:
-    lines = []
-    lines.append(f"Pedido: {_build_order_id(pedido)}")
-
+def _prepare_deal_properties(pedido, cart_items: List[dict]) -> Dict[str, Any]:
+    """
+    Prepara las propiedades para crear un Deal en HubSpot (pipeline/etapa correctos).
+    """
     nombre = _safe(getattr(pedido, "nombre_cliente", None))
     email  = _safe(getattr(pedido, "email", None))
     tel    = _safe(getattr(pedido, "telefono", None))
     ciudad = _safe(getattr(pedido, "ciudad", None))
-    dir1   = _safe(getattr(pedido, "direccion", None))
-
-    if nombre: lines.append(f"Cliente: {nombre}")
-    if email:  lines.append(f"Email: {email}")
-    if tel:    lines.append(f"Teléfono: {tel}")
-    if ciudad or dir1:
-        lines.append(f"Envío: {ciudad or '—'} | {dir1 or '—'}")
-
+    direccion = _safe(getattr(pedido, "direccion", None))
     metodo_entrega = _safe(getattr(pedido, "metodo_entrega", None)).replace("_", " ")
     metodo_pago = _safe(getattr(pedido, "metodo_pago", None)).replace("_", " ")
-    estado = _safe(getattr(pedido, "estado", None))
-    if metodo_entrega: lines.append(f"Método entrega: {metodo_entrega}")
-    if metodo_pago:    lines.append(f"Método pago: {metodo_pago}")
-    if estado:         lines.append(f"Estado: {estado}")
+    estado = _safe(getattr(pedido, "estado", "pendiente"))
+    punto_venta = _safe(getattr(pedido, "punto_venta", None))
+    order_id = _build_order_id(pedido)
 
-    # Resumen carrito
+    # Calcular total y cantidad total desde el carrito
+    total = 0.0
+    total_cantidad = 0
+    for it in cart_items:
+        qty = int(it.get("cantidad", 1))
+        unit = float(it.get("precio_unitario", 0.0))
+        total += unit * qty
+        total_cantidad += qty
+
+    props: Dict[str, Any] = {
+        "dealname": _compose_deal_name(pedido),
+        "amount": str(total),                # numérico en string sin formateo
+        "order_id": order_id,                # idempotencia
+        "pipeline": HS_DEAL_PIPELINE_ID,     # FIX: propiedad correcta
+        "dealstage": HS_DEAL_STAGE_ID,
+
+        # Propiedades personalizadas Cassany (ajusta a tu portal)
+        "custom_cas_numero_confirmacion": order_id,
+        "custom_cas_estado_pedido": estado,
+        "custom_cas_metodo_pago": metodo_pago,
+        "custom_cas_metodo_entrega": metodo_entrega,
+        "custom_cas_estado_pago": "pendiente",
+        "custom_cas_canal_venta": "WhatsApp",
+        "custom_cas_subtotal": str(total),
+        "custom_cas_cantidad": str(total_cantidad if total_cantidad > 0 else (getattr(pedido, "cantidad", 1) or 1)),
+        "custom_cas_telefono_cliente": tel,
+        "custom_cas_nombre_cliente": nombre,
+        "custom_cas_email_cliente": email,
+        "custom_cas_direccion_envio": direccion,
+        "custom_cas_ciudad_envio": ciudad,
+        "custom_cas_notas": _safe(getattr(pedido, "notas", None)),
+    }
+
+    # Punto de venta solo si aplica
+    if metodo_entrega.lower().replace(" ", "_") == "recoger_en_tienda" and punto_venta:
+        props["custom_cas_punto_venta"] = punto_venta
+
+    # Información de productos (JSON)
     if cart_items:
-        lines.append("Items:")
-        total = 0.0
-        for it in cart_items:
-            nombre_it = it.get("nombre") or it.get("sku") or "Item"
-            qty = int(it.get("cantidad", 1))
-            talla = it.get("talla")
-            color = it.get("color")
-            unit = float(it.get("precio_unitario", 0.0))
-            total += unit * qty
-            tail = " ".join([x for x in [color or "", talla or ""] if x]).strip()
-            tail = f" ({tail})" if tail else ""
-            lines.append(f" - {qty}× {nombre_it}{tail} – {_fmt_money_cop(unit)} c/u")
-        lines.append(f"Total estimado: {_fmt_money_cop(total)}")
+        primer_producto = cart_items[0]
+        props.update({
+            "custom_cas_sku_principal": primer_producto.get("sku", ""),
+            "custom_cas_talla_principal": primer_producto.get("talla", ""),
+            "custom_cas_productos": json.dumps([
+                {
+                    "nombre": item.get("nombre", ""),
+                    "sku": item.get("sku", ""),
+                    "talla": item.get("talla", ""),
+                    "cantidad": item.get("cantidad", 1),
+                    "precio": item.get("precio_unitario", 0)
+                } for item in cart_items
+            ], ensure_ascii=False)
+        })
 
-    lines.append("\nSLA: Contactar al cliente ANTES de despachar.")
-    return "\n".join(lines)
+    # Asignar owner si está configurado
+    if HS_DEFAULT_OWNER_ID:
+        props["hubspot_owner_id"] = HS_DEFAULT_OWNER_ID
+
+    # Limpiar propiedades vacías
+    cleaned = {k: v for k, v in props.items() if v not in (None, "", " ")}
+    return cleaned
 
 # ---------- API principal ----------
 
 def enviar_pedido_a_hubspot(pedido) -> bool:
     """
-    1) Upsert de Contacto (email/teléfono).
-    2) Idempotencia: buscar Task con order_id (numero_confirmacion o hash de sesión).
-    3) Crear Task (subject/body, due date +2h, queue/owner opcional).
-    4) Asociar Task ↔ Contact.
+    1) Validaciones de config (token, pipeline, stage).
+    2) Upsert de Contacto (email/teléfono).
+    3) Idempotencia: buscar Deal con order_id (numero_confirmacion o hash de sesión).
+    4) Crear Deal (pedido) con todas las propiedades.
+    5) Asociar Deal ↔ Contact.
+    6) (Opcional) Crear Task operativa SLA +2h y asociarla al Deal y al Contact.
     """
+    # Validaciones
     if not HUBSPOT_TOKEN:
         print("❗ Falta HUBSPOT_ACCESS_TOKEN en .env")
+        return False
+    if not HS_DEAL_PIPELINE_ID:
+        print("❗ Config inválida: HS_DEAL_PIPELINE_ID vacío o no configurado")
+        return False
+    if not HS_DEAL_STAGE_ID:
+        print("❗ Config inválida: HS_DEAL_STAGE_ID vacío o no configurado")
         return False
 
     # 1) Contacto
     contact_id = _upsert_contact_and_get_id(pedido)
     if not contact_id:
-        # No bloquea creación de tarea si contacto falla, pero lo intentamos igual
-        print("⚠️ No se obtuvo contact_id; continúo con Task sin asociación (se reintenta luego).")
+        print("⚠️ No se obtuvo contact_id; continúo con Deal sin asociación.")
 
     # 2) Idempotencia por order_id
     order_id = _build_order_id(pedido)
-    existing_task_id = _find_task_by_order_id(order_id)
-    if existing_task_id:
+    existing_deal_id = _find_deal_by_order_id(order_id)
+    if existing_deal_id:
         # Asegura asociación con Contacto
         if contact_id:
             try:
-                _associate_objects("tasks", existing_task_id, "contacts", contact_id)
+                _associate_objects("deals", existing_deal_id, "contacts", contact_id)
             except Exception:
                 pass
-        print(f"ℹ️ Task ya existía para order_id={order_id} (id={existing_task_id})")
+        print(f"ℹ️ Deal ya existía para order_id={order_id} (id={existing_deal_id})")
         return True
 
-    # 3) Crear Task
-    # Carga carrito
+    # 3) Cargar carrito
     try:
         cart_items = json.loads(getattr(pedido, "carrito_json", "[]") or "[]")
         if not isinstance(cart_items, list):
@@ -474,31 +531,45 @@ def enviar_pedido_a_hubspot(pedido) -> bool:
     except Exception:
         cart_items = []
 
-    subject = _compose_task_subject(pedido)
-    body    = _compose_task_body(pedido, cart_items)
-
-    props: Dict[str, Any] = {
-        "hs_task_subject": subject,
-        "hs_task_body": body,
-        "order_id": str(order_id),
-        # Due date: ahora + 2h (epoch ms)
-        "hs_task_due_date": int(time.time() * 1000) + 2 * 60 * 60 * 1000,
-    }
-    if HS_DEFAULT_OWNER_ID:
-        props["hubspot_owner_id"] = HS_DEFAULT_OWNER_ID
-    if HS_DESPACHOS_QUEUE_ID:
-        props["hs_task_queue_id"] = HS_DESPACHOS_QUEUE_ID
-
-    task_id = _create_task(props)
-    if not task_id:
+    # 4) Crear Deal
+    deal_props = _prepare_deal_properties(pedido, cart_items)
+    deal_id = _create_deal(deal_props)
+    if not deal_id:
         return False
 
-    # 4) Asociar Task ↔ Contact
+    # 5) Asociar Deal ↔ Contact
     if contact_id:
         try:
-            _associate_objects("tasks", task_id, "contacts", contact_id)
+            _associate_objects("deals", deal_id, "contacts", contact_id)
         except Exception:
             pass
 
-    print(f"✅ HubSpot TASK creada id={task_id} order_id={order_id}")
+    print(f"✅ HubSpot DEAL creado id={deal_id} order_id={order_id}")
+
+    # 6) (Opcional) Task operativa SLA +2h
+    if HS_CREATE_SLA_TASK:
+        task_props: Dict[str, Any] = {
+            "hs_task_subject": f"Despachar {deal_props.get('dealname', 'Pedido')}",
+            "hs_task_body": "Revisar pedido y contactar al cliente antes de despachar.",
+            "hs_task_due_date": int(time.time() * 1000) + 2 * 60 * 60 * 1000,  # +2h epoch ms
+        }
+        if HS_DEFAULT_OWNER_ID:
+            task_props["hubspot_owner_id"] = HS_DEFAULT_OWNER_ID
+
+        task_id = _create_task(task_props)
+        if task_id:
+            # Asociar Task con Deal y Contact
+            try:
+                _associate_objects("tasks", task_id, "deals", deal_id)
+            except Exception:
+                pass
+            if contact_id:
+                try:
+                    _associate_objects("tasks", task_id, "contacts", contact_id)
+                except Exception:
+                    pass
+            print(f"🗓️ Task SLA creada id={task_id} asociada a deal={deal_id}")
+        else:
+            print("⚠️ No se pudo crear la Task SLA (opcional).")
+
     return True
