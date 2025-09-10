@@ -1924,13 +1924,8 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         return {"response": "Perfecto, por favor indícame tu dirección y ciudad para el envío."}
 
    if campos_dict.get("direccion") and campos_dict.get("ciudad"):
-    try:
-        pedido_tmp = obtener_pedido_por_sesion(db, session_id)
-        if getattr(pedido_tmp, "numero_confirmacion", None):
-            enviar_pedido_a_hubspot(pedido_tmp)
-    except Exception:
-        pass
-    return { 
+        # Ya no enviamos a HubSpot aquí para evitar duplicados de Deal.
+        return {
             "response": (
                 "Perfecto, he registrado tu dirección y ciudad.\n\n"
                 "Por favor, confirma el método de pago que prefieres:\n"
@@ -2087,6 +2082,7 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
 
