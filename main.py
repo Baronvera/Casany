@@ -335,7 +335,7 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
             print("🟢 Trigger HubSpot (confirmación por intención/regex). Session:", session_id)
             ok_hs = enviar_pedido_a_hubspot(pedido_actualizado)
             print("✅ HubSpot enviado (confirmación/regex), result:", ok_hs)
-       except Exception as e:
+        except Exception as e:
             print("❌ HubSpot error (confirmación/regex):", repr(e))
         
         try:
@@ -2143,6 +2143,7 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
 
