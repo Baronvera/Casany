@@ -152,7 +152,7 @@ SALUDO_RE = re.compile(r'^\s*(hola|buenas(?:\s+(tardes|noches))?|buen(?:o|a)s?\s
 MAS_OPCIONES_RE = re.compile(r'\b(más opciones|mas opciones|muéstrame más|muestrame mas|ver más|ver mas)\b', re.I)
 DOMICILIO_RE = re.compile(r'\b(a\s*domicilio|env[ií]o\s*a\s*domicilio|domicilio)\b', re.I)
 RECOGER_RE  = re.compile(r'\b(recoger(?:lo)?\s+en\s+(tienda|sucursal)|retiro\s+en\s+tienda)\b', re.I)
-SELECCION_RE = re.compile(r'(?:opci(?:o|ó)n\s*(\d+))|(?:\bla\s*(\d+)\b)|(?:n[uú]mero\s*(\d+))|^(?:\s*)(\d+)(?:\s*)$', re.I)
+SELECCION_RE = re.compile(r'(?:opci(?:o|ó)n\s*(\d+))|(?:\bla\s*(\d+)\b)|(?:n[uú]mero\s*(\d+))',re.I)
 
 # Verbos de “agregar”
 ADD_RE = re.compile(r'\b(agrega|agregar|añade|añadir|mete|pon(?:er)?|suma|agregalo|agregá|agregame)\b', re.I)
@@ -867,7 +867,11 @@ def _gen_numero_confirmacion(prefix="CAS"):
 
 def _pedido_missing_fields(pedido) -> list:
     faltan = []
-    if not getattr(pedido, "nombre_cliente", None):
+    carrito = _carrito_load(pedido)
+
+    # Pide nombre SOLO si ya hay señales de compra
+    pedir_nombre = bool(carrito) or bool(getattr(pedido, "metodo_entrega", "")) or bool(getattr(pedido, "metodo_pago", ""))
+    if pedir_nombre and not getattr(pedido, "nombre_cliente", None):
         faltan.append("nombre_cliente")
 
     met_ent = (getattr(pedido, "metodo_entrega", "") or "").strip()
@@ -892,6 +896,7 @@ def _pedido_missing_fields(pedido) -> list:
         faltan.append("metodo_pago")
 
     return faltan
+
 
 def _prompt_for_missing(pedido, faltan: list) -> str:
     if not faltan:
@@ -1322,7 +1327,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
 
     # Fast-path talla sola
     m_talla_solo = TALLA_TOKEN_RE.search(user_text)
-    if m_talla_solo and not MOSTRAR_RE.search(user_text) and not SELECCION_RE.search(user_text) and not ORDINAL_RE.search(user_text):
+    if m_talla_solo and not MOSTRAR_RE.search(user_text):
         talla_elegida = (m_talla_solo.group(1) or "").upper()
         if talla_elegida in TALLAS_VALIDAS:
             ctx_last = _ctx_load(pedido)
@@ -2131,5 +2136,6 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
