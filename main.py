@@ -64,6 +64,9 @@ SALUDO_BASE = os.getenv(
 )
 WA_APP_SECRET = os.getenv("WA_APP_SECRET", "")
 
+HUBSPOT_TOKEN_PRESENT = bool(os.getenv("HUBSPOT_ACCESS_TOKEN", "").strip())
+print(f"🔧 HubSpot token presente: {HUBSPOT_TOKEN_PRESENT}")
+
 client = None
 if OPENAI_API_KEY:
     openai_client_kwargs = {
@@ -327,10 +330,14 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
             actualizar_pedido_por_sesion(db, session_id, "numero_confirmacion", numero)
             pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
 
+
         try:
-            enviar_pedido_a_hubspot(pedido_actualizado)
-        except Exception:
-            pass
+            print("🟢 Trigger HubSpot (confirmación por intención/regex). Session:", session_id)
+            ok_hs = enviar_pedido_a_hubspot(pedido_actualizado)
+            print("✅ HubSpot enviado (confirmación/regex), result:", ok_hs)
+       except Exception as e:
+            print("❌ HubSpot error (confirmación/regex):", repr(e))
+        
         try:
             mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
             await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, mensaje_alerta)
@@ -2136,6 +2143,7 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
 
