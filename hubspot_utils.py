@@ -19,7 +19,6 @@ HS_UPSERT_CONTACTS = os.getenv("HS_UPSERT_CONTACTS", "0").strip() == "1"
 HS_TASK_DUE_HOURS = int(os.getenv("HS_TASK_DUE_HOURS", "2"))  # vencimiento por defecto: ahora + 2h
 ASSOC_OBJECTS_DEFAULT = "https://api.hubapi.com/crm/v4/objects/{from_obj}/{from_id}/associations/default/{to_obj}/{to_id}"
 
-
 # Endpoints
 BASE_CONTACTS   = "https://api.hubapi.com/crm/v3/objects/contacts"
 SEARCH_CONTACTS = "https://api.hubapi.com/crm/v3/objects/contacts/search"
@@ -202,18 +201,22 @@ def _build_task_body(pedido) -> str:
     store          = _safe(getattr(pedido, "punto_venta", None)) or "N/A"
 
     customer_name  = _safe(getattr(pedido, "nombre_cliente", None)) or "[Sin nombre]"
-    raw_phone      = getattr(pedido, "telefono", "") or (safe(getattr(pedido, "session_id", "")) or "").replace("cliente", "").replace("cliente", "")
+    # Extrae número desde session_id si no hay telefono
+    sid_for_phone  = _safe(getattr(pedido, "session_id", ""))
+    # Soporta 'cliente_<numero>' y fallback para 'cliente'
+    sid_for_phone  = sid_for_phone.replace("cliente_", "").replace("cliente", "")
+    raw_phone      = getattr(pedido, "telefono", "") or sid_for_phone
     customer_phone = _to_e164_tel(raw_phone)
     customer_email = _safe(getattr(pedido, "email", None)) or "(no disponible)"
     customer_doc   = _safe(getattr(pedido, "tipo_documento", None)) or "(no disponible)"
 
-    delivery_method  = (safe(getattr(pedido, "metodo_entrega", None)) or "por definir").replace("", " ")
+    delivery_method  = (_safe(getattr(pedido, "metodo_entrega", None)) or "por definir").replace("_", " ")
     delivery_address = _safe(getattr(pedido, "direccion", None)) or "(no disponible)"
     delivery_city    = _safe(getattr(pedido, "ciudad", None)) or ""
     if delivery_city and delivery_city not in delivery_address:
         delivery_address = (delivery_address if delivery_address != "(no disponible)" else "") + (f" - {delivery_city}" if delivery_city else "")
 
-    payment_method    = (safe(getattr(pedido, "metodo_pago", None)) or "por definir").replace("", " ").capitalize()
+    payment_method    = (_safe(getattr(pedido, "metodo_pago", None)) or "por definir").replace("_", " ").capitalize()
     payment_status    = _safe(getattr(pedido, "estado_pago", None)) or "pendiente"
     payment_reference = _safe(getattr(pedido, "referencia_pago", None)) or "(no disponible)"
 
@@ -327,7 +330,9 @@ def _build_email_from_phone(session_id: Optional[str], telefono: Optional[str]) 
     return f"guest_{int(time.time())}@cassany.co"
 
 def _prepare_contact_properties(pedido) -> Dict[str, Any]:
-    telefono_raw = getattr(pedido, "telefono", None) or safe(getattr(pedido, "session_id", "")).replace("cliente", "").replace("cliente", "")
+    sid_for_phone = _safe(getattr(pedido, "session_id", ""))
+    sid_for_phone = sid_for_phone.replace("cliente_", "").replace("cliente", "")
+    telefono_raw = getattr(pedido, "telefono", None) or sid_for_phone
     plain57, plus57 = _norm_phone_variants(telefono_raw)
     email_real = _safe(getattr(pedido, "email", ""))
     email = email_real or _build_email_from_phone(getattr(pedido, "session_id", None), telefono_raw)
@@ -357,7 +362,9 @@ def _upsert_contact_and_get_id(pedido) -> Optional[str]:
 
     props = _prepare_contact_properties(pedido)
     email = props.get("email", "")
-    telefono_raw = getattr(pedido, "telefono", None) or safe(getattr(pedido, "session_id", "")).replace("cliente", "").replace("cliente", "")
+    sid_for_phone = _safe(getattr(pedido, "session_id", ""))
+    sid_for_phone = sid_for_phone.replace("cliente_", "").replace("cliente", "")
+    telefono_raw = getattr(pedido, "telefono", None) or sid_for_phone
     phone_variants = _norm_phone_variants(telefono_raw)
 
     # Intentar encontrar primero
@@ -447,7 +454,6 @@ def _associate_objects(from_obj: str, from_id: str, to_obj: str, to_id: str, *, 
         except Exception:
             print("❌ HubSpot association error:", repr(e))
 
-
 # ---------- Tasks (buscar / crear / actualizar) ----------
 def _search_task_by_subject(subject: str) -> Optional[str]:
     """
@@ -474,7 +480,6 @@ def _search_task_by_subject(subject: str) -> Optional[str]:
 
 def _now_epoch_ms_plus(hours: int = 0) -> int:
     return int((datetime.now(timezone.utc) + timedelta(hours=hours)).timestamp() * 1000)
-
 
 def _create_task(subject: str, body_text: str) -> Optional[str]:
     payload = {
@@ -556,9 +561,11 @@ def enviar_pedido_a_hubspot(pedido) -> bool:
                 contact_id = _upsert_contact_and_get_id(pedido)
             else:
                 # Solo buscar, NO crear
-                telefono_raw = getattr(pedido, "telefono", None) or safe(getattr(pedido, "session_id", "")).replace("cliente", "").replace("cliente", "")
+                sid_for_phone = _safe(getattr(pedido, "session_id", ""))
+                sid_for_phone = sid_for_phone.replace("cliente_", "").replace("cliente", "")
+                telefono_raw = getattr(pedido, "telefono", None) or sid_for_phone
                 email_guess  = _build_email_from_phone(getattr(pedido, "session_id", None), telefono_raw)
-                contact_id = _search_contact(email_guess, _norm_phone_variants(telefono_raw))
+                contact_id   = _search_contact(email_guess, _norm_phone_variants(telefono_raw))
             if contact_id:
                 try:
                     _associate_objects("tasks", task_id, "contacts", contact_id)
