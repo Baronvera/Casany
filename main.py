@@ -2118,19 +2118,35 @@ async def receive_whatsapp_message(
                     db.close()
     return {"status": "received"}
 
+def _normalize_to_msisdn(numero: str) -> str:
+    # E.164 sin '+': '573001112233'
+    return "".join(ch for ch in str(numero) if ch.isdigit())
+
 async def enviar_mensaje_whatsapp(numero: str, mensaje: str):
     url = f"https://graph.facebook.com/{WA_GRAPH_API_VER}/{WHATSAPP_PHONE_NUMBER}/messages"
-    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-    payload = {"messaging_product": "whatsapp", "to": numero, "type": "text", "text": {"body": mensaje}}
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    to_msisdn = _normalize_to_msisdn(numero)
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_msisdn,
+        "type": "text",
+        "text": {"body": mensaje}
+    }
     try:
-        async with httpx.AsyncClient(timeout=10) as client_http:
+        async with httpx.AsyncClient(timeout=20) as client_http:
             r = await client_http.post(url, headers=headers, json=payload)
+        if r.status_code >= 400:
+            print("❌ Error envío WhatsApp:", r.status_code, r.text)
+            # Si ves "131047" aquí, significa ventana >24h -> usar plantilla
             r.raise_for_status()
-        print("✅ Mensaje enviado a WhatsApp")
+        print(f"✅ Mensaje enviado a {to_msisdn}")
     except Exception as exc:
-        print("❌ Error envío WhatsApp:", exc)
-        print("🚀 Enviando mensaje a:", numero)
-        print("📨 Contenido:", mensaje)
+        print("❌ Error envío WhatsApp (exception):", repr(exc))
+        print("📤 Endpoint:", url)
+        print("📨 Payload:", payload)
 
 @app.get("/__version")
 def version():
@@ -2143,6 +2159,7 @@ async def test_whatsapp():
 
 # ---------- INIT ----------
 init_db()
+
 
 
 
