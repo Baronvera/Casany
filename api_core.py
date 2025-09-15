@@ -20,6 +20,8 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
+last_activity = Column(DateTime(timezone=True))
+from sqlalchemy import DateTime
 from openai import OpenAI
 
 from database import SessionLocal
@@ -853,9 +855,8 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
         })
         pedido = obtener_pedido_por_sesion(db, session_id)
 
-    last_act_utc = getattr(pedido, "last_activity", ahora.replace(tzinfo=UTC))
-    if not isinstance(last_act_utc, datetime):
-        last_act_utc = ahora.replace(tzinfo=UTC)
+    last_act_raw = getattr(pedido, "last_activity", None)
+    last_act_utc = _as_aware_utc(last_act_raw) if last_act_raw else ahora
     tiempo_inactivo = ahora - last_act_utc
 
     raw_text = user_input.message.strip()
@@ -1442,4 +1443,16 @@ def _gen_numero_confirmacion(prefix="CAS"):
     ts = datetime.now(timezone.utc).strftime("%Y%m%d")
     suf = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"{prefix}-{ts}-{suf}"
+
+# --- util para asegurar tz-aware en UTC ---
+def _as_aware_utc(dt) -> datetime:
+    if isinstance(dt, datetime):
+        return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+    # si viniera como string ISO:
+    try:
+        d = datetime.fromisoformat(str(dt))
+        return d if d.tzinfo else d.replace(tzinfo=UTC)
+    except Exception:
+        return now_utc()
+
 
