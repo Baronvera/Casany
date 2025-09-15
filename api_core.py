@@ -20,7 +20,6 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
-last_activity = Column(DateTime(timezone=True))
 from sqlalchemy import DateTime
 from openai import OpenAI
 
