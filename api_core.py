@@ -988,7 +988,7 @@ async def mensaje_whatsapp(user_input: UserMessage, session_id: str, db: Session
             if not getattr(pedido_actualizado, "numero_confirmacion", None):
                 numero = _gen_numero_confirmacion()
                 actualizar_pedido_por_sesion(db, session_id, "numero_confirmacion", numero)
-                                pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
+                pedido_actualizado = obtener_pedido_por_sesion(db, session_id)
             try:
                 ctx_tmp.pop("awaiting_confirmation", None)
                 _ctx_save(db, session_id, ctx_tmp)
