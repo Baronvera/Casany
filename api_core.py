@@ -118,7 +118,19 @@ def init_runtime():
 # WhatsApp helpers (expuestos también para webhook.py)
 # -------------------------------------------------------------------
 def _normalize_to_msisdn(numero: str) -> str:
-    return "".join(ch for ch in str(numero) if ch.isdigit())
+    """
+    Normaliza a E.164: + y solo dígitos. Acepta insumos con espacios, guiones o 00.
+    Ej.: '57 311-330-5646' -> '+573113305646'
+    """
+    s = str(numero or "").strip()
+    if not s:
+        return s
+    # quita todo menos dígitos
+    digits = "".join(ch for ch in s if ch.isdigit())
+    # si venía con 00 al inicio, igualamos a +
+    if digits.startswith("00"):
+        digits = digits[2:]
+    return f"+{digits}"
 
 async def enviar_mensaje_whatsapp(numero: str, mensaje: str):
     url = f"https://graph.facebook.com/{WA_GRAPH_API_VER}/{WHATSAPP_PHONE_NUMBER}/messages"
@@ -144,6 +156,39 @@ async def enviar_mensaje_whatsapp(numero: str, mensaje: str):
         print("❌ Error envío WhatsApp (exception):", repr(exc))
         print("📤 Endpoint:", url)
         print("📨 Payload:", payload)
+        
+def _parse_alert_numbers() -> list[str]:
+    base = (os.getenv("ALERTA_WHATSAPP", "") or "").strip()
+    extra = (os.getenv("ALERTA_WHATSAPP_2", "") or "").strip()
+    raw = ",".join([v for v in [base, extra] if v]).strip(", ")
+    nums = []
+    for chunk in raw.split(","):
+        n = chunk.strip()
+        if not n:
+            continue
+        # Mantén '+' inicial y dígitos; además, exige '+' al comienzo
+        n = n if n.startswith("+") else f"+{''.join(ch for ch in n if ch.isdigit())}"
+        # normaliza: + y dígitos únicamente
+        n = "+" + "".join(ch for ch in n if ch.isdigit())
+        nums.append(n)
+
+    # dedupe manteniendo orden
+    seen = set(); out = []
+    for n in nums:
+        if n not in seen:
+            seen.add(n); out.append(n)
+    return out
+
+async def enviar_alerta_whatsapp(mensaje: str):
+    numeros = _parse_alert_numbers()
+    if not numeros:
+        print("⚠️  No hay números de alerta configurados.")
+        return
+    for num in numeros:
+        try:
+            await enviar_mensaje_whatsapp(num, mensaje)
+        except Exception as e:
+            print(f"❌ Error enviando alerta a {num}: {repr(e)}")
 
 # -------------------------------------------------------------------
 # Modelos / dependencia DB
@@ -541,7 +586,7 @@ async def procesar_mensaje_usuario(text: str, db, session_id, pedido):
 
         try:
             mensaje_alerta = generar_mensaje_atencion_humana(pedido_actualizado)
-            await enviar_mensaje_whatsapp(ALERTA_WHATSAPP, mensaje_alerta)
+            await enviar_alerta_whatsapp(mensaje_alerta)                               
         except Exception as e:
             print("❌ Error alerta interna:", repr(e))
 
